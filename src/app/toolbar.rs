@@ -58,6 +58,8 @@ pub struct ToolbarState {
     pub fit_width: bool,
     pub find: FindStatus,
     pub pages_panel_open: bool,
+    /// A print job is running (one at a time).
+    pub printing: bool,
 }
 
 // `impl Default` says what `ToolbarState::default()` returns: here, no file open.
@@ -74,22 +76,13 @@ impl Default for ToolbarState {
             fit_width: false,
             find: FindStatus::Idle,
             pages_panel_open: false,
+            printing: false,
         }
     }
 }
 
 /// Disabled tooltip for everything that needs an open file.
 const OPEN_FIRST: &str = "Open a PDF first";
-
-/// TEMPORARY: the tooltip for features whose task hasn't wired them yet. This is
-/// the one place that keeps them disabled; Task 10b takes Print out of
-/// `not_built_yet` and deletes both.
-const NOT_BUILT_YET: &str = "Not built yet";
-
-/// TEMPORARY: see `NOT_BUILT_YET`.
-fn not_built_yet(action: ToolbarAction) -> bool {
-    action == ToolbarAction::Print
-}
 
 /// "Delete page" for one page, "Delete 3 pages" for several.
 pub fn delete_label(selected: usize) -> String {
@@ -110,7 +103,7 @@ pub fn disabled_reason(action: ToolbarAction, state: &ToolbarState) -> Option<&'
         return Some(OPEN_FIRST);
     }
     let has_matches = matches!(state.find, FindStatus::Matches { total, .. } if total > 0);
-    let reason = match action {
+    match action {
         ToolbarAction::Save if !state.is_modified => Some("No unsaved changes"),
         ToolbarAction::Undo if !state.can_undo => Some("Nothing to undo"),
         ToolbarAction::DeleteSelected if state.selected_count == 0 => {
@@ -120,10 +113,9 @@ pub fn disabled_reason(action: ToolbarAction, state: &ToolbarState) -> Option<&'
             Some("A PDF needs at least one page")
         }
         ToolbarAction::FindNext | ToolbarAction::FindPrevious if !has_matches => Some("No matches"),
+        ToolbarAction::Print if state.printing => Some("Already printing"),
         _ => None,
-    };
-    // The real reasons come first, so they stay right once the feature is built.
-    reason.or_else(|| not_built_yet(action).then_some(NOT_BUILT_YET))
+    }
 }
 
 /// Why the find field can't be used right now, or `None` when it can.
@@ -755,6 +747,23 @@ mod tests {
         assert_eq!(
             disabled_reason(ToolbarAction::Export, &document(0, 5)),
             None
+        );
+    }
+
+    #[test]
+    fn disabled_reason_should_allow_print_with_a_document() {
+        assert_eq!(disabled_reason(ToolbarAction::Print, &document(0, 5)), None);
+    }
+
+    #[test]
+    fn disabled_reason_should_allow_one_print_at_a_time() {
+        let state = ToolbarState {
+            printing: true,
+            ..document(0, 5)
+        };
+        assert_eq!(
+            disabled_reason(ToolbarAction::Print, &state),
+            Some("Already printing")
         );
     }
 

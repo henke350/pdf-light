@@ -1,5 +1,5 @@
 //! The pages panel: page thumbnails down the left side, where pages are
-//! selected for deleting (and, later, exporting and printing).
+//! selected for deleting, exporting and printing.
 //!
 //! Like the page view, it lists the kept pages in order: positions count the
 //! pages shown, `pages[position]` is the page's index in the original file.

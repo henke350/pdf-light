@@ -6,6 +6,7 @@ pub mod edit;
 pub mod error;
 pub mod export;
 pub mod pages;
+pub mod print_layout;
 pub mod render;
 pub mod render_pool;
 pub mod search;

@@ -21,6 +21,20 @@ rfd = "0.18"
 thiserror = "2"
 anyhow = "1"
 
+# Printing goes through Windows' own print dialog and GDI. The `windows` crate
+# is Rust bindings to those APIs (no C library); only the parts used are enabled.
+# The same version rfd and winit already pull in, so nothing new is downloaded.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    "Win32_System_Memory",
+    "Win32_UI_Controls_Dialogs",
+] }
+# The main window's handle, which the print dialog needs as its owner.
+raw-window-handle = "0.6"
+
 [profile.release]
 lto = true
 codegen-units = 1

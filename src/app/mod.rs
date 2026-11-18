@@ -5,6 +5,10 @@ mod export_dialog;
 mod find;
 mod icons;
 mod page_view;
+// `#[cfg(windows)]` compiles the next item only when building for Windows:
+// printing uses Windows' own print dialog and printer drivers.
+#[cfg(windows)]
+mod print;
 mod sidebar;
 mod textures;
 mod theme;
@@ -103,6 +107,12 @@ pub struct App {
     title: String,
     /// The owner chose Discard (or saved) when closing: let the close through.
     allow_close: bool,
+    /// The main window, which owns the print dialog.
+    #[cfg(windows)]
+    owner: Option<print::Owner>,
+    /// The print job running in the background, if any.
+    #[cfg(windows)]
+    printing: Option<print::PrintRun>,
 }
 
 impl App {
@@ -123,6 +133,10 @@ impl App {
             pages_panel_open: true,
             title: "pdf-light".to_owned(),
             allow_close: false,
+            #[cfg(windows)]
+            owner: print::Owner::of(cc),
+            #[cfg(windows)]
+            printing: None,
         };
         if let Some(path) = path {
             app.open_file(&cc.egui_ctx, &path);
@@ -312,6 +326,92 @@ impl App {
         ))));
     }
 
+    /// Print: the Windows print dialog, then a background print job with its
+    /// progress in the status bar. A hidden panel's selection doesn't count
+    /// (same rule as Delete and Export).
+    #[cfg(windows)]
+    fn start_print(&mut self, ctx: &egui::Context) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if self.printing.is_some() {
+            return;
+        }
+        let selected = if self.pages_panel_open {
+            open.selection.positions()
+        } else {
+            Vec::new()
+        };
+        let page_count = open.pages.len();
+        let chosen = match self.owner {
+            Some(owner) => {
+                print::choose_printer(owner, page_count, !selected.is_empty(), &open.name())
+            }
+            None => Err("the window isn't ready for printing".to_owned()),
+        };
+        let job = match chosen {
+            Ok(Some(job)) => job,
+            Ok(None) => return, // Cancelled in the dialog.
+            Err(reason) => {
+                self.error = Some(ErrorMessage::new("Couldn't print", &reason));
+                return;
+            }
+        };
+        // The dialog is modal, so the document is still the one it was opened for.
+        match print::chosen_positions(&job.pages, page_count, &selected) {
+            Ok(positions) => {
+                self.printing = Some(print::PrintRun::start(
+                    ctx,
+                    Arc::clone(&open.document.bytes),
+                    open.pages.kept().to_vec(),
+                    positions,
+                    job,
+                ));
+            }
+            Err(reason) => self.error = Some(ErrorMessage::new("Couldn't print", &reason)),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn start_print(&mut self, _ctx: &egui::Context) {
+        self.error = Some(ErrorMessage::new(
+            "Couldn't print",
+            &"printing needs Windows",
+        ));
+    }
+
+    /// Picks up a finished print job: its message, or the error dialog.
+    #[cfg(windows)]
+    fn poll_print(&mut self, ctx: &egui::Context) {
+        let Some(outcome) = self.printing.as_ref().and_then(print::PrintRun::poll) else {
+            return;
+        };
+        self.printing = None;
+        match outcome {
+            print::Outcome::Done(message) => self.show_status(ctx, message),
+            print::Outcome::Cancelled => self.show_status(ctx, "Printing cancelled".to_owned()),
+            print::Outcome::Failed(reason) => {
+                self.error = Some(ErrorMessage::new("Couldn't print", &reason));
+            }
+        }
+    }
+
+    /// "Printing page 3 of 12" for the status bar, while printing.
+    fn print_progress(&self) -> Option<String> {
+        #[cfg(windows)]
+        return self.printing.as_ref().map(print::PrintRun::progress_text);
+        #[cfg(not(windows))]
+        return None;
+    }
+
+    /// The status bar's Cancel was clicked: abort the print job.
+    fn cancel_print(&self) {
+        #[cfg(windows)]
+        if let Some(run) = &self.printing {
+            run.cancel();
+        }
+    }
+
     fn show_status(&mut self, ctx: &egui::Context, text: String) {
         let now = ctx.input(|i| i.time);
         self.status = Some(StatusMessage {
@@ -341,6 +441,7 @@ impl App {
             fit_width: open.view.fits_width(),
             find: open.find.status(),
             pages_panel_open: self.pages_panel_open,
+            printing: self.print_progress().is_some(),
         }
     }
 
@@ -389,8 +490,7 @@ impl App {
                 }
             }
             ToolbarAction::Export => self.open_export(),
-            // Drawn but disabled until Task 10b wires it.
-            ToolbarAction::Print => {}
+            ToolbarAction::Print => self.start_print(ctx),
         }
     }
 
@@ -407,6 +507,13 @@ impl App {
             export.cancel_and_wait();
             self.dialog = None;
             self.show_status(ctx, "Export cancelled".to_owned());
+        }
+        // The same for printing: abort the job (AbortDoc) and wait until the
+        // print thread has let go of the printer.
+        #[cfg(windows)]
+        if close_requested && let Some(run) = self.printing.take() {
+            run.cancel_and_wait();
+            self.show_status(ctx, "Printing cancelled".to_owned());
         }
         if close_requested && self.is_modified() && !self.allow_close {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -476,37 +583,58 @@ impl App {
     }
 
     /// File name ("(edited)" while there are unsaved changes), "Page N of M",
-    /// and on the right a short-lived message such as "Saved report.pdf".
-    fn status_bar(&self, ui: &mut egui::Ui, state: &ToolbarState) {
+    /// and on the right "Printing page 3 of 12" with Cancel while printing, or
+    /// else a short-lived message such as "Saved report.pdf". Returns `true`
+    /// when Cancel was clicked.
+    fn status_bar(&self, ui: &mut egui::Ui, state: &ToolbarState) -> bool {
         let palette = theme::palette(ui.ctx());
         let now = ui.input(|i| i.time);
+        let print_progress = self.print_progress();
         ui.horizontal(|ui| {
-            let (Some(open), Some(name)) = (&self.open, &state.file_name) else {
-                return;
-            };
-            ui.label(
-                RichText::new(file_status(name, state.is_modified))
-                    .size(theme::SMALL_SIZE)
-                    .color(palette.ink),
-            );
-            ui.add_space(24.0);
-            // Right after a delete the view still reports last frame's page.
-            let page = (open.view.current_page() + 1).min(state.page_count);
-            ui.label(
-                RichText::new(format!("Page {page} of {}", state.page_count))
-                    .size(theme::SMALL_SIZE)
-                    .color(palette.quiet),
-            );
-            if let Some(status) = self.status.as_ref().filter(|s| now < s.until) {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if let (Some(open), Some(name)) = (&self.open, &state.file_name) {
+                Self::file_and_page(ui, open, name, state);
+            }
+            // Right to left: what is added first sits at the far right.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if let Some(progress) = &print_progress {
+                    let cancel = ui.link(RichText::new("Cancel").size(theme::SMALL_SIZE));
+                    ui.label(
+                        RichText::new(progress)
+                            .size(theme::SMALL_SIZE)
+                            .color(palette.ink),
+                    );
+                    return cancel.clicked();
+                }
+                if let Some(status) = self.status.as_ref().filter(|s| now < s.until) {
                     ui.label(
                         RichText::new(&status.text)
                             .size(theme::SMALL_SIZE)
                             .color(palette.ink),
                     );
-                });
-            }
-        });
+                }
+                false
+            })
+            .inner
+        })
+        .inner
+    }
+
+    /// The left of the status bar: "report.pdf (edited)" and "Page N of M".
+    fn file_and_page(ui: &mut egui::Ui, open: &OpenDocument, name: &str, state: &ToolbarState) {
+        let palette = theme::palette(ui.ctx());
+        ui.label(
+            RichText::new(file_status(name, state.is_modified))
+                .size(theme::SMALL_SIZE)
+                .color(palette.ink),
+        );
+        ui.add_space(24.0);
+        // Right after a delete the view still reports last frame's page.
+        let page = (open.view.current_page() + 1).min(state.page_count);
+        ui.label(
+            RichText::new(format!("Page {page} of {}", state.page_count))
+                .size(theme::SMALL_SIZE)
+                .color(palette.quiet),
+        );
     }
 
     /// Keeps the window title in step: "report.pdf • — pdf-light" while modified.
@@ -539,6 +667,8 @@ impl eframe::App for App {
             self.request_open(&ctx, Some(path));
         }
         self.hold_close(&ctx);
+        #[cfg(windows)]
+        self.poll_print(&ctx);
         if let Some(open) = &mut self.open {
             // Turn finished renders into textures; this never waits.
             while let Some(result) = open.pool.try_recv() {
@@ -572,13 +702,17 @@ impl eframe::App for App {
         }
 
         let state = self.toolbar_state();
-        egui::Panel::bottom("status")
+        let cancel_print = egui::Panel::bottom("status")
             .frame(
                 Frame::NONE
                     .fill(palette.panel)
                     .inner_margin(Margin::symmetric(10, 4)),
             )
-            .show(ui, |ui| self.status_bar(ui, &state));
+            .show(ui, |ui| self.status_bar(ui, &state))
+            .inner;
+        if cancel_print {
+            self.cancel_print();
+        }
 
         let panel_open = self.pages_panel_open;
         let mut panel_actions = Vec::new();

@@ -2362,9 +2362,11 @@ dependencies = [
  "hayro-interpret",
  "image",
  "lopdf",
+ "raw-window-handle",
  "rfd",
  "thiserror 2.0.21",
  "tiff",
+ "windows",
 ]
 
 [[package]]
