@@ -90,6 +90,8 @@ pub fn existing_outputs(paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Exports `pages` (pairs of position and original page index) and returns the files written.
+/// `page_count` is the page count of the document as the owner sees it (after deletions);
+/// it decides the file-name padding, the same as the dialog's preview uses.
 ///
 /// `progress(done, total)` runs after each page; returning `false` cancels the export,
 /// removes every file this run wrote and gives `Err(Cancelled)`. `&dyn Fn(..) -> bool`
@@ -97,6 +99,7 @@ pub fn existing_outputs(paths: &[PathBuf]) -> Vec<PathBuf> {
 pub fn export_pages(
     pdf: &Pdf,
     pages: &[(usize, usize)],
+    page_count: usize,
     opts: &ExportOptions,
     progress: &dyn Fn(usize, usize) -> bool,
 ) -> Result<Vec<PathBuf>, PdfError> {
@@ -111,7 +114,7 @@ pub fn export_pages(
     }
 
     let positions: Vec<usize> = pages.iter().map(|&(position, _)| position).collect();
-    let paths = output_paths(opts, &positions, all_pages.len());
+    let paths = output_paths(opts, &positions, page_count);
 
     let mut written = Vec::new();
     match write_all(pdf, pages, opts, scale, &paths, &mut written, progress) {

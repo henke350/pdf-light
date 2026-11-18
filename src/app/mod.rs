@@ -398,6 +398,16 @@ impl App {
     /// back until the owner answers Save / Discard / Cancel.
     fn hold_close(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|i| i.viewport().close_requested());
+        // Never exit mid-write: stop a running export and wait for its
+        // clean-up, then go on with the normal close flow below.
+        if close_requested
+            && let Some(Dialog::Export(export)) = &mut self.dialog
+            && export.is_running()
+        {
+            export.cancel_and_wait();
+            self.dialog = None;
+            self.show_status(ctx, "Export cancelled".to_owned());
+        }
         if close_requested && self.is_modified() && !self.allow_close {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             if !matches!(self.dialog, Some(Dialog::Unsaved(_))) {

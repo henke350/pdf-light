@@ -285,6 +285,15 @@ struct Job {
     result: mpsc::Receiver<Result<Vec<PathBuf>, PdfError>>,
 }
 
+// Dropping a `Job` (the dialog going away for any reason) cancels the export;
+// the library then removes the files it wrote. `Drop::drop` runs automatically
+// when a value goes out of scope.
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 enum Phase {
     Editing,
     /// "Overwrite N existing files?" with the number of files in the way.
@@ -382,6 +391,20 @@ impl ExportDialog {
         Outcome::Open
     }
 
+    /// Whether an export is running right now.
+    pub fn is_running(&self) -> bool {
+        matches!(self.phase, Phase::Running(_))
+    }
+
+    /// Cancels a running export and waits (a few seconds at most) for its
+    /// thread to remove the files it wrote. Used before the window closes.
+    pub fn cancel_and_wait(&mut self) {
+        if let Phase::Running(job) = &self.phase {
+            job.cancel.store(true, Ordering::Relaxed);
+            let _ = job.result.recv_timeout(std::time::Duration::from_secs(10));
+        }
+    }
+
     /// Checks whether the background export has ended.
     fn poll_job(&self) -> Option<Outcome> {
         let Phase::Running(job) = &self.phase else {
@@ -444,6 +467,7 @@ impl ExportDialog {
         // `move` hands the clones to the thread. Each thread opens its own
         // `Pdf`, because hayro's `Pdf` can't be shared between threads.
         let bytes = Arc::clone(&self.bytes);
+        let page_count = self.sizes.len();
         let (thread_cancel, thread_done, thread_ctx) =
             (Arc::clone(&cancel), Arc::clone(&done), ctx.clone());
         std::thread::spawn(move || {
@@ -453,7 +477,7 @@ impl ExportDialog {
                 !thread_cancel.load(Ordering::Relaxed)
             };
             let outcome = document::open_pdf(&bytes)
-                .and_then(|pdf| export_pages(&pdf, &pages, &options, &progress));
+                .and_then(|pdf| export_pages(&pdf, &pages, page_count, &options, &progress));
             // The dialog may be gone already; then nobody needs the result.
             let _ = sender.send(outcome);
             thread_ctx.request_repaint();
@@ -853,6 +877,50 @@ mod tests {
             [overwrite_question(1), overwrite_question(4)],
             ["Overwrite 1 existing file?", "Overwrite 4 existing files?"]
         );
+    }
+
+    fn job() -> (Job, mpsc::Sender<Result<Vec<PathBuf>, PdfError>>) {
+        let (sender, result) = mpsc::channel();
+        let job = Job {
+            cancel: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicUsize::new(0)),
+            total: 1,
+            folder: PathBuf::new(),
+            result,
+        };
+        (job, sender)
+    }
+
+    #[test]
+    fn dropping_a_job_should_cancel_it() {
+        let (job, _sender) = job();
+        let cancel = Arc::clone(&job.cancel);
+        drop(job);
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancel_and_wait_should_cancel_and_return_once_the_thread_reports() {
+        let (job, sender) = job();
+        let cancel = Arc::clone(&job.cancel);
+        let mut dialog = ExportDialog::new(
+            Path::new("a.pdf"),
+            Arc::new(Vec::new()),
+            vec![0],
+            vec![(612.0, 792.0)],
+            vec![],
+        );
+        dialog.phase = Phase::Running(job);
+        assert!(dialog.is_running());
+        // Stands in for the export thread noticing the cancel and finishing.
+        let thread = std::thread::spawn(move || {
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            let _ = sender.send(Err(PdfError::Cancelled));
+        });
+        dialog.cancel_and_wait();
+        assert!(thread.join().is_ok());
     }
 
     #[test]
