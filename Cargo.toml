@@ -1,0 +1,21 @@
+[package]
+name = "pdf-light"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hayro = { version = "0.9", features = ["embed-fonts"] }
+hayro-interpret = "0.9"
+lopdf = "0.47"
+eframe = "0.37"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tiff = "0.11"
+rfd = "*"
+thiserror = "*"
+anyhow = "*"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
