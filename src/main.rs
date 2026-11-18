@@ -1,5 +1,10 @@
 //! Entry point: starts the window and opens the file named on the command line, if any.
 
+// In release builds this is a Windows GUI program, so no console window opens
+// next to it. Debug builds keep the console for panic messages and logs.
+// `cfg_attr(condition, attribute)` applies the attribute only when the condition holds.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 
 use eframe::egui;
@@ -25,10 +30,22 @@ fn main() -> anyhow::Result<()> {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    eframe::run_native(
+    let started = eframe::run_native(
         "pdf-light",
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc, path)))),
-    )
-    .map_err(|e| anyhow::anyhow!("couldn't start the window: {e}"))
+    );
+    if let Err(error) = &started {
+        // Without a console an error returned from `main` is never seen, so
+        // say it in a message box before giving up.
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("pdf-light")
+            .set_description(format!(
+                "pdf-light couldn't start: {error}. It needs a graphics driver with OpenGL 2 or newer."
+            ))
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+    started.map_err(|e| anyhow::anyhow!("couldn't start the window: {e}"))
 }
