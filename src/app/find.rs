@@ -8,8 +8,7 @@ use eframe::egui;
 use pdf_light::search::normalize_query;
 use pdf_light::search_worker::{PageMatches, SearchHandle, TextCache, spawn_search};
 use pdf_light::text::PageRect;
-use std::collections::HashMap;
-use std::ops::Range;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
@@ -83,7 +82,7 @@ impl Find {
                     Arc::new(move || repaint_ctx.request_repaint());
                 self.reveal_first = wanted != self.query;
                 self.reveal = false;
-                self.matches = Matches::default();
+                self.matches = Matches::new(kept);
                 // Replacing the handle drops the old one, which cancels its search.
                 self.handle = Some(spawn_search(
                     Arc::clone(bytes),
@@ -187,59 +186,108 @@ pub struct Match {
     pub rects: Vec<PageRect>,
 }
 
-/// The matches found so far, in the order the search found them (from the
-/// page the search started on, wrapping), and which one is current. Matches
-/// are only ever added at the end, so the current match, and its number in
-/// "3 of 27", stay put while more results arrive.
+/// The matches found so far, in page order, and which one is current.
+///
+/// Results arrive in search order (from the current page, wrapping), so each
+/// page's matches are filed under that page's position in the kept list; a
+/// `BTreeMap` keeps its keys sorted, so walking it goes through the pages in
+/// document order. "3 of 27" counts in that order. The current match is held
+/// by identity (which page, which match on it), so its highlight stays put
+/// while its number grows as earlier pages report in.
 #[derive(Debug, Default)]
 pub struct Matches {
-    list: Vec<Match>,
-    /// Where each page's matches sit in `list` (a page arrives once, whole).
-    by_page: HashMap<usize, Range<usize>>,
-    /// Index into `list`; `Some` whenever `list` isn't empty.
-    current: Option<usize>,
+    /// Position in the kept list of each kept page (original index).
+    positions: HashMap<usize, usize>,
+    /// Each page's matches, by the page's position; a page arrives once, whole.
+    by_position: BTreeMap<usize, Vec<Match>>,
+    /// (position, index on that page); `Some` whenever there is a match.
+    current: Option<(usize, usize)>,
 }
 
 impl Matches {
+    /// No matches yet, for a search over `kept` (original indices in document order).
+    pub fn new(kept: &[usize]) -> Self {
+        Self {
+            positions: kept
+                .iter()
+                .enumerate()
+                .map(|(position, &page)| (page, position))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
     /// Adds one page's matches. The first match found becomes current: the
     /// search starts at the current page, so it is the first one at or after it.
+    /// Pages that aren't kept are ignored.
     pub fn push(&mut self, found: PageMatches) {
-        let start = self.list.len();
-        let page = found.page;
-        self.list
-            .extend(found.matches.into_iter().map(|rects| Match { page, rects }));
-        self.by_page.insert(page, start..self.list.len());
-        if self.current.is_none() && !self.list.is_empty() {
-            self.current = Some(0);
+        let PageMatches { page, matches } = found;
+        let Some(&position) = self.positions.get(&page) else {
+            return;
+        };
+        if matches.is_empty() {
+            return;
+        }
+        let list = matches.into_iter().map(|rects| Match { page, rects });
+        self.by_position.insert(position, list.collect());
+        if self.current.is_none() {
+            self.current = Some((position, 0));
         }
     }
 
-    /// Makes the next match current, wrapping to the first.
+    /// Makes the next match in page order current, wrapping to the first.
     pub fn next(&mut self) {
-        if let Some(current) = self.current {
-            self.current = Some((current + 1) % self.list.len());
-        }
+        let Some((position, index)) = self.current else {
+            return;
+        };
+        let on_page = self.by_position.get(&position).map_or(0, Vec::len);
+        self.current = if index + 1 < on_page {
+            Some((position, index + 1))
+        } else {
+            // The first page with matches after this one, else the first of all.
+            let later = self.by_position.range(position + 1..).next();
+            later
+                .or_else(|| self.by_position.iter().next())
+                .map(|(&p, _)| (p, 0))
+        };
     }
 
-    /// Makes the previous match current, wrapping to the last.
+    /// Makes the previous match in page order current, wrapping to the last.
     pub fn previous(&mut self) {
-        if let Some(current) = self.current {
-            let len = self.list.len();
-            self.current = Some((current + len - 1) % len);
-        }
+        let Some((position, index)) = self.current else {
+            return;
+        };
+        self.current = if index > 0 {
+            Some((position, index - 1))
+        } else {
+            // The last match of the page before, else of the last page of all.
+            let earlier = self.by_position.range(..position).next_back();
+            earlier
+                .or_else(|| self.by_position.iter().next_back())
+                .map(|(&p, list)| (p, list.len().saturating_sub(1)))
+        };
     }
 
     pub fn current(&self) -> Option<&Match> {
-        self.current.and_then(|i| self.list.get(i))
+        let (position, index) = self.current?;
+        self.by_position.get(&position)?.get(index)
     }
 
     /// "3 of 27" (counting as results arrive), "Searching…" or "No matches".
     pub fn status(&self, searching: bool) -> FindStatus {
+        let total = self.by_position.values().map(Vec::len).sum();
         match self.current {
-            Some(current) => FindStatus::Matches {
-                current: current + 1,
-                total: self.list.len(),
-            },
+            Some((position, index)) => {
+                let before: usize = self
+                    .by_position
+                    .range(..position)
+                    .map(|(_, l)| l.len())
+                    .sum();
+                FindStatus::Matches {
+                    current: before + index + 1,
+                    total,
+                }
+            }
             None if searching => FindStatus::Searching,
             None => FindStatus::NoMatches,
         }
@@ -247,15 +295,15 @@ impl Matches {
 
     /// The matches on `page` (original index), each with whether it is current.
     pub fn on_page(&self, page: usize) -> impl Iterator<Item = (&Match, bool)> {
-        let range = self.by_page.get(&page).cloned().unwrap_or_default();
+        let position = self.positions.get(&page).copied();
+        let on_page = position
+            .and_then(|p| self.by_position.get(&p))
+            .map_or(&[][..], Vec::as_slice);
         let current = self.current;
-        // `get` with a range gives `None` instead of panicking if it were out
-        // of bounds; the empty slice is then the `Default`.
-        let on_page = self.list.get(range.clone()).unwrap_or_default();
         on_page
             .iter()
-            .zip(range)
-            .map(move |(m, i)| (m, Some(i) == current))
+            .enumerate()
+            .map(move |(i, m)| (m, position.map(|p| (p, i)) == current))
     }
 }
 
@@ -338,6 +386,64 @@ mod tests {
         matches.current().map(|m| (m.page, m.rects[0].y0))
     }
 
+    /// Kept pages 0 to 9, in order.
+    const TEN_PAGES: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+    fn of(current: usize, total: usize) -> FindStatus {
+        FindStatus::Matches { current, total }
+    }
+
+    #[test]
+    fn matches_should_number_in_page_order_whatever_the_arrival_order() {
+        // The search started on page 3 and wrapped round to pages 1 and 2.
+        let mut matches = Matches::new(&[1, 2, 3]);
+        matches.push(found(3, &[10.0]));
+        matches.push(found(1, &[20.0, 30.0]));
+        matches.push(found(2, &[40.0]));
+        assert_eq!(
+            (current(&matches), matches.status(false)),
+            (Some((3, 10.0)), of(4, 4))
+        );
+    }
+
+    #[test]
+    fn matches_should_keep_the_current_match_while_its_number_changes() {
+        let mut matches = Matches::new(&[1, 2, 3]);
+        matches.push(found(2, &[10.0]));
+        let before = matches.status(true);
+        matches.push(found(1, &[20.0, 30.0]));
+        assert_eq!(
+            (before, current(&matches), matches.status(true)),
+            (of(1, 1), Some((2, 10.0)), of(3, 3))
+        );
+    }
+
+    #[test]
+    fn matches_should_step_in_page_order() {
+        let mut matches = Matches::new(&[1, 2, 3]);
+        matches.push(found(1, &[10.0]));
+        matches.push(found(3, &[30.0]));
+        matches.push(found(2, &[20.0]));
+        matches.next();
+        let next = current(&matches);
+        matches.next();
+        matches.next();
+        let wrapped = current(&matches);
+        matches.previous();
+        let back = current(&matches);
+        assert_eq!(
+            (next, wrapped, back),
+            (Some((2, 20.0)), Some((1, 10.0)), Some((3, 30.0)))
+        );
+    }
+
+    #[test]
+    fn matches_should_ignore_pages_that_are_not_kept() {
+        let mut matches = Matches::new(&[1, 2]);
+        matches.push(found(5, &[10.0]));
+        assert_eq!(matches.status(false), FindStatus::NoMatches);
+    }
+
     #[test]
     fn search_order_should_start_at_the_current_page_and_wrap() {
         assert_eq!(search_order(&[0, 2, 3, 5], 2), vec![3, 5, 0, 2]);
@@ -350,14 +456,14 @@ mod tests {
 
     #[test]
     fn matches_should_make_the_first_match_current() {
-        let mut matches = Matches::default();
+        let mut matches = Matches::new(TEN_PAGES);
         matches.push(found(4, &[30.0, 50.0]));
         assert_eq!(current(&matches), Some((4, 30.0)));
     }
 
     #[test]
     fn matches_should_keep_the_current_match_as_results_arrive() {
-        let mut matches = Matches::default();
+        let mut matches = Matches::new(TEN_PAGES);
         matches.push(found(4, &[30.0, 50.0]));
         matches.next();
         matches.push(found(6, &[10.0]));
@@ -383,7 +489,7 @@ mod tests {
 
     #[test]
     fn matches_should_wrap_when_stepping() {
-        let mut matches = Matches::default();
+        let mut matches = Matches::new(TEN_PAGES);
         matches.push(found(1, &[10.0]));
         matches.push(found(2, &[20.0]));
         matches.next();
@@ -399,7 +505,7 @@ mod tests {
 
     #[test]
     fn matches_should_report_searching_then_no_matches() {
-        let mut matches = Matches::default();
+        let mut matches = Matches::new(TEN_PAGES);
         matches.next(); // Stepping with nothing found does nothing.
         assert_eq!(
             (
@@ -413,7 +519,7 @@ mod tests {
 
     #[test]
     fn matches_should_list_a_pages_matches_and_mark_the_current_one() {
-        let mut matches = Matches::default();
+        let mut matches = Matches::new(TEN_PAGES);
         matches.push(found(1, &[10.0]));
         matches.push(found(2, &[20.0, 40.0]));
         matches.next();
