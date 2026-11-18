@@ -82,13 +82,13 @@ impl Default for ToolbarState {
 const OPEN_FIRST: &str = "Open a PDF first";
 
 /// TEMPORARY: the tooltip for features whose task hasn't wired them yet. This is
-/// the one place that keeps them disabled; Tasks 10–10b take their action out of
-/// `not_built_yet`, and the last one deletes both.
+/// the one place that keeps them disabled; Task 10b takes Print out of
+/// `not_built_yet` and deletes both.
 const NOT_BUILT_YET: &str = "Not built yet";
 
 /// TEMPORARY: see `NOT_BUILT_YET`.
 fn not_built_yet(action: ToolbarAction) -> bool {
-    matches!(action, ToolbarAction::Export | ToolbarAction::Print)
+    action == ToolbarAction::Print
 }
 
 /// "Delete page" for one page, "Delete 3 pages" for several.
@@ -747,6 +747,14 @@ mod tests {
         assert_eq!(
             reasons,
             vec![Some("Open a PDF first"); needs_document.len()]
+        );
+    }
+
+    #[test]
+    fn disabled_reason_should_allow_export_with_a_document() {
+        assert_eq!(
+            disabled_reason(ToolbarAction::Export, &document(0, 5)),
+            None
         );
     }
 

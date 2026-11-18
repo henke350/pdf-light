@@ -1,6 +1,7 @@
 //! The window: toolbar, pages panel, page view, status bar and dialogs.
 
 mod dialogs;
+mod export_dialog;
 mod find;
 mod icons;
 mod page_view;
@@ -13,6 +14,7 @@ use dialogs::{
     ErrorMessage, UnsavedChoice, error_dialog, overwrite_dialog, unsaved_changes_dialog,
 };
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, ViewportCommand};
+use export_dialog::{ExportDialog, Outcome};
 use find::Find;
 use page_view::PageView;
 use pdf_light::document::{self, Document};
@@ -68,6 +70,8 @@ enum Dialog {
     ConfirmOverwrite,
     /// "Save changes to report.pdf?", then carry on with what was asked for.
     Unsaved(Pending),
+    /// The Export dialog, which also runs the export while it is open.
+    Export(Box<ExportDialog>),
 }
 
 /// What the owner asked for when the unsaved-changes dialog stepped in.
@@ -288,6 +292,26 @@ impl App {
         }
     }
 
+    /// Opens the Export dialog. A hidden panel's selection can't be seen, so it
+    /// doesn't count (same rule as Delete).
+    fn open_export(&mut self) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let selected = if self.pages_panel_open {
+            open.selection.positions()
+        } else {
+            Vec::new()
+        };
+        self.dialog = Some(Dialog::Export(Box::new(ExportDialog::new(
+            &open.document.path,
+            Arc::clone(&open.document.bytes),
+            open.pages.kept().to_vec(),
+            open.sizes(),
+            selected,
+        ))));
+    }
+
     fn show_status(&mut self, ctx: &egui::Context, text: String) {
         let now = ctx.input(|i| i.time);
         self.status = Some(StatusMessage {
@@ -364,8 +388,9 @@ impl App {
                     open.find.step(action == ToolbarAction::FindNext);
                 }
             }
-            // Drawn but disabled until Tasks 10-10b wire them.
-            ToolbarAction::Export | ToolbarAction::Print => {}
+            ToolbarAction::Export => self.open_export(),
+            // Drawn but disabled until Task 10b wires it.
+            ToolbarAction::Print => {}
         }
     }
 
@@ -416,6 +441,15 @@ impl App {
                     }
                 }
                 Some(UnsavedChoice::Discard) => self.carry_on(ctx, pending),
+            },
+            Dialog::Export(mut export) => match export.show(ctx) {
+                Outcome::Open => self.dialog = Some(Dialog::Export(export)),
+                Outcome::Closed => {}
+                Outcome::Done(message) => self.show_status(ctx, message),
+                Outcome::Cancelled => self.show_status(ctx, "Export cancelled".to_owned()),
+                Outcome::Failed(error) => {
+                    self.error = Some(ErrorMessage::new("Couldn't export the pages", &error));
+                }
             },
         }
     }
