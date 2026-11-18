@@ -8,7 +8,13 @@ use std::path::PathBuf;
 // `anyhow::Result` holds any error type, which suits the top of the program.
 fn main() -> anyhow::Result<()> {
     // The first argument is the file to open, so Windows "Open with" works.
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    // `absolute` makes "report.pdf" a full path from the current folder, so the
+    // Save as folder and "is this the same file?" checks work; if it fails, the
+    // path is used as given.
+    let path = std::env::args_os().nth(1).map(|arg| {
+        let path = PathBuf::from(arg);
+        std::path::absolute(&path).unwrap_or(path)
+    });
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("pdf-light")

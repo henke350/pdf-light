@@ -667,8 +667,13 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
 
         let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
-        if let Some(path) = dropped {
-            self.request_open(&ctx, Some(path));
+        let dialog_open = self.dialog.is_some() || self.error.is_some();
+        match drop_action(dropped, dialog_open) {
+            Some(DropAction::Open(path)) => self.request_open(&ctx, Some(path)),
+            Some(DropAction::Refuse) => {
+                self.show_status(&ctx, "Finish or close the open dialog first".to_owned());
+            }
+            None => {}
         }
         self.hold_close(&ctx);
         #[cfg(windows)]
@@ -808,6 +813,28 @@ impl eframe::App for App {
     }
 }
 
+/// What a file dropped on the window does.
+#[derive(Debug, PartialEq)]
+enum DropAction {
+    /// Open it (after asking about unsaved changes).
+    Open(PathBuf),
+    /// Leave the open dialog alone and say why nothing happened.
+    Refuse,
+}
+
+/// Decides what a dropped file does. While a dialog or error message is open
+/// a drop is refused: opening would replace the dialog, which could cancel a
+/// running export or turn a pending close into an open.
+fn drop_action(dropped: Option<PathBuf>, dialog_open: bool) -> Option<DropAction> {
+    // `?` on an `Option` returns `None` early when there's nothing inside.
+    let path = dropped?;
+    Some(if dialog_open {
+        DropAction::Refuse
+    } else {
+        DropAction::Open(path)
+    })
+}
+
 /// "report.pdf", or "report.pdf (edited)" while there are unsaved changes.
 fn file_status(name: &str, modified: bool) -> String {
     if modified {
@@ -844,6 +871,28 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_action_should_open_the_file_when_no_dialog_is_open() {
+        let path = PathBuf::from("report.pdf");
+        assert_eq!(
+            drop_action(Some(path.clone()), false),
+            Some(DropAction::Open(path))
+        );
+    }
+
+    #[test]
+    fn drop_action_should_refuse_while_a_dialog_is_open() {
+        assert_eq!(
+            drop_action(Some(PathBuf::from("report.pdf")), true),
+            Some(DropAction::Refuse)
+        );
+    }
+
+    #[test]
+    fn drop_action_should_do_nothing_without_a_dropped_file() {
+        assert_eq!(drop_action(None, true), None);
+    }
 
     #[test]
     fn file_status_should_mark_unsaved_changes() {
