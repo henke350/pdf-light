@@ -2,7 +2,9 @@
 //! the binary in `main.rs` only starts the window.
 
 pub mod document;
+pub mod edit;
 pub mod error;
+pub mod pages;
 pub mod render;
 pub mod search;
 pub mod text;
