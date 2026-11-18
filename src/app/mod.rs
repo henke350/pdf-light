@@ -1,6 +1,7 @@
 //! The window: toolbar, pages panel, page view, status bar and dialogs.
 
 mod dialogs;
+mod find;
 mod icons;
 mod page_view;
 mod sidebar;
@@ -12,6 +13,7 @@ use dialogs::{
     ErrorMessage, UnsavedChoice, error_dialog, overwrite_dialog, unsaved_changes_dialog,
 };
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, ViewportCommand};
+use find::Find;
 use page_view::PageView;
 use pdf_light::document::{self, Document};
 use pdf_light::edit;
@@ -40,6 +42,8 @@ struct OpenDocument {
     pool: RenderPool,
     view: PageView,
     panel: PagesPanel,
+    /// Find in document: the search, its matches and its text cache.
+    find: Find,
     /// What was last handed to the pool, so it's only told about changes.
     requested: Vec<RenderRequest>,
     /// The owner answered "Overwrite" to "Overwrite report.pdf?" for this document.
@@ -149,7 +153,11 @@ impl App {
     /// Opens `path`, replacing the current document, or shows why it can't.
     fn open_file(&mut self, ctx: &egui::Context, path: &Path) {
         match document::open(path) {
-            Ok(document) => self.open = Some(self.start(ctx, document, PageView::new())),
+            Ok(document) => {
+                // Another file: the old query means nothing here.
+                self.find_query.clear();
+                self.open = Some(self.start(ctx, document, PageView::new()));
+            }
             Err(error) => {
                 let title = format!("Couldn't open {}", file_name(path));
                 self.error = Some(ErrorMessage::new(title, &error));
@@ -158,7 +166,8 @@ impl App {
     }
 
     /// Everything that belongs to a freshly opened `document`: all pages kept,
-    /// nothing selected, a new render pool. `view` keeps its zoom and scroll.
+    /// nothing selected, a new render pool and no search yet. `view` keeps its
+    /// zoom and scroll.
     fn start(&self, ctx: &egui::Context, document: Document, view: PageView) -> OpenDocument {
         let repaint_ctx = ctx.clone();
         // The pool calls this from its threads; `request_repaint` is thread-safe.
@@ -171,6 +180,7 @@ impl App {
             pool,
             view,
             panel: PagesPanel::new(),
+            find: Find::new(),
             requested: Vec::new(),
             overwrite_confirmed: false,
         }
@@ -243,6 +253,15 @@ impl App {
                 view.reset_textures();
                 let mut reopened = self.start(ctx, document, view);
                 reopened.overwrite_confirmed = overwrite_confirmed;
+                // The saved file holds the kept pages in the same order, so the
+                // view's page positions and the query still apply.
+                reopened.find.resume(
+                    ctx,
+                    &self.find_query,
+                    reopened.pages.kept(),
+                    reopened.view.current_page(),
+                    &reopened.document.bytes,
+                );
                 self.open = Some(reopened);
             }
             Err(error) => {
@@ -282,7 +301,6 @@ impl App {
         let Some(open) = &self.open else {
             return ToolbarState::default();
         };
-        // Find is filled in by Task 9.
         ToolbarState {
             file_name: Some(open.name()),
             is_modified: open.pages.is_modified(),
@@ -297,8 +315,8 @@ impl App {
             page_count: open.pages.len(),
             zoom_percent: open.view.zoom(),
             fit_width: open.view.fits_width(),
+            find: open.find.status(),
             pages_panel_open: self.pages_panel_open,
-            ..ToolbarState::default()
         }
     }
 
@@ -341,11 +359,13 @@ impl App {
                     _ => view.fit_width(),
                 }
             }
-            // Drawn but disabled until Tasks 9-10b wire them.
-            ToolbarAction::FindNext
-            | ToolbarAction::FindPrevious
-            | ToolbarAction::Export
-            | ToolbarAction::Print => {}
+            ToolbarAction::FindNext | ToolbarAction::FindPrevious => {
+                if let Some(open) = &mut self.open {
+                    open.find.step(action == ToolbarAction::FindNext);
+                }
+            }
+            // Drawn but disabled until Tasks 10-10b wire them.
+            ToolbarAction::Export | ToolbarAction::Print => {}
         }
     }
 
@@ -484,6 +504,7 @@ impl eframe::App for App {
                     open.view.receive(&ctx, result);
                 }
             }
+            open.find.receive();
         }
 
         let palette = theme::palette(&ctx);
@@ -550,12 +571,32 @@ impl eframe::App for App {
             }
         }
 
+        if let Some(open) = &mut self.open {
+            // After every action this frame, so a delete or undo restarts the search now.
+            let current = open.view.current_page();
+            let kept = open.pages.kept();
+            open.find
+                .update(&ctx, &self.find_query, kept, current, &open.document.bytes);
+            // Copy the page and rect out, so `open.find` isn't borrowed any more.
+            let target = open
+                .find
+                .take_reveal()
+                .and_then(|found| Some((found.page, *found.rects.first()?)));
+            if let Some((page, rect)) = target
+                && let Some(position) = kept.iter().position(|&p| p == page)
+            {
+                let sizes = open.sizes();
+                open.view.reveal(position, rect, &sizes);
+            }
+        }
+
         let open_clicked = egui::CentralPanel::no_frame()
             .frame(Frame::NONE.fill(palette.desk))
             .show(ui, |ui| match &mut self.open {
                 Some(open) => {
                     let sizes = open.sizes();
-                    open.view.show(ui, &sizes, open.pages.kept());
+                    open.view
+                        .show(ui, &sizes, open.pages.kept(), open.find.matches());
                     false
                 }
                 None => page_view::empty_state(ui),

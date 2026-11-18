@@ -7,15 +7,17 @@
 //! pages (0 = the first page shown); `pages[position]` is the page's index in
 //! the original file, which is what textures and render requests use.
 
+use super::find::{Match, Matches};
 use super::icons::Icon;
 use super::textures::{self, TextureCache, TextureKey, texture_key};
 use super::theme::{self, LARGE_SIZE, TEXT_SIZE};
 use super::toolbar::ToolButton;
 use eframe::egui::{
-    self, Align2, Color32, FontId, Key, Modifiers, Pos2, Rect, RichText, ScrollArea, Sense, Vec2,
-    pos2, vec2,
+    self, Align2, Color32, FontId, Key, Modifiers, Painter, Pos2, Rect, RichText, ScrollArea,
+    Sense, TextureId, Vec2, pos2, vec2,
 };
 use pdf_light::render_pool::{RenderRequest, RenderResult};
+use pdf_light::text::PageRect;
 use pdf_light::view::{self, PageLayout};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -30,6 +32,9 @@ const TEXTURE_BUDGET: usize = 256 * 1024 * 1024;
 const ZOOM_SETTLE_SECS: f64 = 0.15;
 /// How far an arrow key scrolls, in logical pixels.
 const ARROW_STEP: f32 = 40.0;
+/// How strongly the matches that aren't current are marked (the toolbar spec's
+/// "Marker at about 45 % alpha"); the current match gets full Marker.
+const MATCH_STRENGTH: f32 = 0.45;
 
 /// Scroll position, zoom and page images for one open document.
 pub struct PageView {
@@ -114,6 +119,26 @@ impl PageView {
         }
     }
 
+    /// Scrolls so `rect` (in points) on the page at `position` is in view:
+    /// not at all if it already is, otherwise centred on it.
+    pub fn reveal(&mut self, position: usize, rect: PageRect, sizes: &[(f32, f32)]) {
+        let px = view::points_to_px(self.zoom);
+        let layout = view::layout_pages(sizes, px, GAP);
+        let (Some(&(width, _)), Some(&top)) =
+            (layout.sizes.get(position), layout.tops.get(position))
+        else {
+            return;
+        };
+        // Where the page sits in the content, as `paint_pages` places it.
+        let left = (content_width(&layout, self.view_rect.width()) - width) / 2.0;
+        let top = MARGIN + top;
+        let offset = self.scroll_to.unwrap_or(self.offset);
+        let view = self.view_rect.size();
+        let x = view::reveal(offset.x, view.x, left + rect.x0 * px, left + rect.x1 * px);
+        let y = view::reveal(offset.y, view.y, top + rect.y0 * px, top + rect.y1 * px);
+        self.scroll_to = Some(vec2(x, y).max(Vec2::ZERO)); // Clamped to the content in `show`.
+    }
+
     /// Zoom in percent.
     pub fn zoom(&self) -> f32 {
         self.zoom
@@ -136,9 +161,16 @@ impl PageView {
         self.set_zoom(zoom, self.view_rect.size() / 2.0, sizes, now);
     }
 
-    /// Draws the kept pages (`sizes` in points, `pages` their original indices),
-    /// handles scrolling and zooming, and works out which pages to render next.
-    pub fn show(&mut self, ui: &mut egui::Ui, sizes: &[(f32, f32)], pages: &[usize]) {
+    /// Draws the kept pages (`sizes` in points, `pages` their original indices)
+    /// with the search `matches` marked, handles scrolling and zooming, and
+    /// works out which pages to render next.
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        sizes: &[(f32, f32)],
+        pages: &[usize],
+        matches: &Matches,
+    ) {
         self.frame += 1;
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
@@ -168,7 +200,7 @@ impl PageView {
         }
         let output = area.show_viewport(ui, |ui, viewport| {
             let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
-            self.paint_pages(ui, rect.min, &layout, pages, viewport, content.x);
+            self.paint_pages(ui, rect.min, &layout, pages, matches, viewport, content.x);
         });
         self.offset = output.state.clamped_offset();
         self.view_rect = output.inner_rect;
@@ -258,18 +290,26 @@ impl PageView {
         }
     }
 
-    /// Paints the pages that intersect `viewport` (in content coordinates).
+    /// Paints the pages that intersect `viewport` (in content coordinates),
+    /// with their search matches.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site; each argument is a different part of the frame"
+    )]
     fn paint_pages(
         &mut self,
         ui: &egui::Ui,
         origin: Pos2,
         layout: &PageLayout,
         pages: &[usize],
+        matches: &Matches,
         viewport: Rect,
         content_width: f32,
     ) {
         let ppp = ui.ctx().pixels_per_point();
-        let target_scale = view::points_to_px(self.zoom) * ppp;
+        let px_per_pt = view::points_to_px(self.zoom);
+        let target_scale = px_per_pt * ppp;
+        let marker = theme::palette(ui.ctx()).marker;
         let painter = ui.painter();
         for position in view::visible_range(layout, viewport.min.y - MARGIN, viewport.height()) {
             let (Some(&(width, height)), Some(&top), Some(&page)) = (
@@ -291,9 +331,13 @@ impl PageView {
             );
 
             // Stretch the closest cached image while a sharper one is on its way.
-            if let Some(texture) = self.textures.best(page, target_scale, self.frame) {
+            let texture = self
+                .textures
+                .best(page, target_scale, self.frame)
+                .map(|t| t.id());
+            if let Some(texture) = texture {
                 let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-                painter.image(texture.id(), rect, uv, Color32::WHITE);
+                painter.image(texture, rect, uv, Color32::WHITE);
             } else if self.failed.iter().any(|&(p, _)| p == page) {
                 painter.rect_filled(rect, 0.0, Color32::from_gray(200));
                 painter.text(
@@ -306,6 +350,13 @@ impl PageView {
             } else {
                 painter.rect_filled(rect, 0.0, Color32::WHITE);
             }
+            let marks = Marks {
+                page: rect,
+                px_per_pt,
+                texture,
+                marker,
+            };
+            marks.paint(painter, matches.on_page(page));
         }
     }
 
@@ -345,6 +396,52 @@ impl PageView {
                     scale,
                     thumbnail: false,
                 });
+            }
+        }
+    }
+}
+
+/// How to mark search matches on one page, drawn on screen at `page`.
+struct Marks {
+    page: Rect,
+    px_per_pt: f32,
+    /// The page image, if one is showing.
+    texture: Option<TextureId>,
+    marker: Color32,
+}
+
+impl Marks {
+    /// Paints each match's rects: the current match in full Marker, the others
+    /// at `MATCH_STRENGTH`. Each mark is the page image drawn again over itself,
+    /// tinted: a tint multiplies, so white paper turns yellow while dark text
+    /// stays dark, like a real highlighter (plain translucent yellow on top
+    /// would wash the text out, and full Marker would hide it).
+    fn paint<'a>(&self, painter: &Painter, matches: impl Iterator<Item = (&'a Match, bool)>) {
+        let faint = Color32::WHITE.lerp_to_gamma(self.marker, MATCH_STRENGTH);
+        let size = self.page.size();
+        for (found, current) in matches {
+            let tint = if current { self.marker } else { faint };
+            for r in &found.rects {
+                let min = self.page.min + vec2(r.x0, r.y0) * self.px_per_pt;
+                let max = self.page.min + vec2(r.x1, r.y1) * self.px_per_pt;
+                let mark = Rect::from_min_max(min, max).intersect(self.page);
+                if !mark.is_positive() {
+                    continue;
+                }
+                match self.texture {
+                    Some(texture) => {
+                        // The same part of the image: positions as fractions of the page.
+                        let uv = Rect::from_min_max(
+                            ((mark.min - self.page.min) / size).to_pos2(),
+                            ((mark.max - self.page.min) / size).to_pos2(),
+                        );
+                        painter.image(texture, mark, uv, tint);
+                    }
+                    // A blank white page waiting for its image: white tinted is the tint.
+                    None => {
+                        painter.rect_filled(mark, 0.0, tint);
+                    }
+                }
             }
         }
     }

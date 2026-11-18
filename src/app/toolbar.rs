@@ -33,10 +33,6 @@ pub enum ToolbarAction {
 
 /// Where the search is.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-#[expect(
-    dead_code,
-    reason = "the toolbar can show every state; Task 9's search reports them"
-)]
 pub enum FindStatus {
     #[default]
     Idle,
@@ -86,19 +82,13 @@ impl Default for ToolbarState {
 const OPEN_FIRST: &str = "Open a PDF first";
 
 /// TEMPORARY: the tooltip for features whose task hasn't wired them yet. This is
-/// the one place that keeps them disabled; Tasks 8–10b take their action out of
+/// the one place that keeps them disabled; Tasks 10–10b take their action out of
 /// `not_built_yet`, and the last one deletes both.
 const NOT_BUILT_YET: &str = "Not built yet";
 
-/// TEMPORARY: see `NOT_BUILT_YET`. `FindNext` here also keeps the find field disabled.
+/// TEMPORARY: see `NOT_BUILT_YET`.
 fn not_built_yet(action: ToolbarAction) -> bool {
-    matches!(
-        action,
-        ToolbarAction::FindNext
-            | ToolbarAction::FindPrevious
-            | ToolbarAction::Export
-            | ToolbarAction::Print
-    )
+    matches!(action, ToolbarAction::Export | ToolbarAction::Print)
 }
 
 /// "Delete page" for one page, "Delete 3 pages" for several.
@@ -138,13 +128,7 @@ pub fn disabled_reason(action: ToolbarAction, state: &ToolbarState) -> Option<&'
 
 /// Why the find field can't be used right now, or `None` when it can.
 fn find_field_reason(state: &ToolbarState) -> Option<&'static str> {
-    if state.file_name.is_none() {
-        Some(OPEN_FIRST)
-    } else if not_built_yet(ToolbarAction::FindNext) {
-        Some(NOT_BUILT_YET)
-    } else {
-        None
-    }
+    state.file_name.is_none().then_some(OPEN_FIRST)
 }
 
 /// The icon on the button for `action`; `None` for actions without a button.
@@ -375,7 +359,8 @@ fn row_width(ui: &Ui, items: &[Item], state: &ToolbarState, labels: bool, find: 
 }
 
 /// Draws the toolbar into `ui` and returns what the owner asked for this frame,
-/// by click or by shortcut. `query` is the find field's text.
+/// by click or by shortcut. `query` is the find field's text; Esc in the field
+/// empties it, which ends the search.
 pub fn show(ui: &mut Ui, state: &ToolbarState, query: &mut String) -> Vec<ToolbarAction> {
     let actions = shortcut_actions(ui.ctx(), state);
     let focus_find = ui.ctx().input_mut(|i| {
@@ -570,6 +555,13 @@ impl Toolbar<'_> {
                 self.actions.push(action);
             }
             response.request_focus();
+        }
+        // egui drops the field's focus as soon as Esc is pressed, so the pages
+        // panel would see the key next and clear its selection. Taking the key
+        // here keeps it for the field: Esc closes the search, nothing else.
+        if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+            ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            self.query.clear();
         }
     }
 
@@ -809,6 +801,39 @@ mod tests {
             .map(|action| disabled_reason(action, &state))
             .collect();
         assert_eq!(reasons, vec![None; actions.len()]);
+    }
+
+    #[test]
+    fn disabled_reason_should_allow_stepping_only_with_matches() {
+        let with = |find| ToolbarState {
+            find,
+            ..document(0, 5)
+        };
+        let matches = with(FindStatus::Matches {
+            current: 1,
+            total: 3,
+        });
+        let reasons = [
+            disabled_reason(ToolbarAction::FindNext, &matches),
+            disabled_reason(ToolbarAction::FindPrevious, &matches),
+            disabled_reason(ToolbarAction::FindNext, &with(FindStatus::NoMatches)),
+            disabled_reason(ToolbarAction::FindPrevious, &with(FindStatus::Searching)),
+        ];
+        assert_eq!(
+            reasons,
+            [None, None, Some("No matches"), Some("No matches")]
+        );
+    }
+
+    #[test]
+    fn find_field_should_be_usable_once_a_document_is_open() {
+        assert_eq!(
+            (
+                find_field_reason(&no_document()),
+                find_field_reason(&document(0, 5))
+            ),
+            (Some("Open a PDF first"), None)
+        );
     }
 
     #[test]

@@ -223,6 +223,20 @@ pub fn thumbnail_scale(page_size: (f32, f32), width: f32, pixels_per_point: f32)
     thumbnail_width * pixels_per_point / page_size.0.max(1.0)
 }
 
+/// The scroll position along one axis that shows `start..end` (content
+/// coordinates) in a view `len` long now at `view_start`: unchanged if it is
+/// already wholly in view, otherwise centred on it (its start shown first if
+/// it is longer than the view). Not clamped to the content.
+pub fn reveal(view_start: f32, len: f32, start: f32, end: f32) -> f32 {
+    if start >= view_start && end <= view_start + len {
+        view_start
+    } else if end - start > len {
+        start
+    } else {
+        (start + end) / 2.0 - len / 2.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +449,26 @@ mod tests {
     fn thumbnail_scale_should_ignore_small_width_changes() {
         let scale = |width| thumbnail_scale((612.0, 792.0), width, 1.0);
         assert_eq!(scale(130.0), scale(150.0));
+    }
+    #[test]
+    fn reveal_should_not_move_when_the_target_is_in_view() {
+        assert_eq!(reveal(100.0, 500.0, 150.0, 170.0), 100.0);
+    }
+
+    #[test]
+    fn reveal_should_centre_a_target_out_of_view() {
+        // A 20 px target at 1000 in a 500 px view: its middle (1010) goes to 250.
+        assert_eq!(
+            [
+                reveal(100.0, 500.0, 1000.0, 1020.0),
+                reveal(2000.0, 500.0, 1000.0, 1020.0)
+            ],
+            [760.0, 760.0]
+        );
+    }
+
+    #[test]
+    fn reveal_should_show_the_start_of_a_target_longer_than_the_view() {
+        assert_eq!(reveal(0.0, 100.0, 300.0, 600.0), 300.0);
     }
 }
