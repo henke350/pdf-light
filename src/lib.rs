@@ -4,3 +4,5 @@
 pub mod document;
 pub mod error;
 pub mod render;
+pub mod search;
+pub mod text;
