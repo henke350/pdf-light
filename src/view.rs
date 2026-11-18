@@ -153,6 +153,7 @@ pub fn render_scale(page_size: (f32, f32), wanted: f32, max_side: usize) -> f32 
     let (width, height) = (page_size.0.max(1.0), page_size.1.max(1.0));
     let side_cap = max_side as f32 / width.max(height);
     let pixel_cap = (MAX_TEXTURE_PIXELS / (width * height)).sqrt();
+    // Accepted for v1: near 800 % the cap makes pages slightly blurry (no tiling).
     let scale = wanted.min(side_cap).min(pixel_cap);
     (scale * 64.0).floor().max(1.0) / 64.0
 }

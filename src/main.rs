@@ -14,6 +14,8 @@ fn main() -> anyhow::Result<()> {
             .with_title("pdf-light")
             .with_inner_size([900.0, 760.0])
             .with_drag_and_drop(true),
+        // OpenGL starts faster and makes a smaller exe than wgpu (see Cargo.toml).
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(

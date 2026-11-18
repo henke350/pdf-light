@@ -7,7 +7,14 @@ edition = "2024"
 hayro = { version = "0.9", features = ["embed-fonts"] }
 hayro-interpret = "0.9"
 lopdf = "0.47"
-eframe = "0.37"
+# OpenGL (glow) instead of the default wgpu backend: faster start, smaller exe.
+# Only the default features the app uses are kept (no wgpu, x11, wayland, web).
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "accesskit",
+    "clipboard",
+] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 tiff = "0.11"
 rfd = "0.18"
