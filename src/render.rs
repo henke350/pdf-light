@@ -27,14 +27,20 @@ pub fn pixel_size(page_size: (f32, f32), scale: f32) -> (u64, u64) {
     )
 }
 
+/// Fails with `TooLarge` when a `width` × `height` canvas is over the limits.
+pub(crate) fn check_size(width: u64, height: u64) -> Result<(), PdfError> {
+    if width > MAX_SIDE_PX || height > MAX_SIDE_PX || width.saturating_mul(height) > MAX_PIXELS {
+        return Err(PdfError::TooLarge { width, height });
+    }
+    Ok(())
+}
+
 /// Renders page `index` at `scale` (1.0 = 72 dpi). Refuses sizes that are too big.
 pub fn render_page(pdf: &Pdf, index: usize, scale: f32) -> Result<RenderedPage, PdfError> {
     let page = pdf.pages().get(index).ok_or(PdfError::Invalid)?;
     let (width, height) = pixel_size(page.render_dimensions(), scale);
     // Check before rendering: hayro would silently truncate oversized canvases.
-    if width > MAX_SIDE_PX || height > MAX_SIDE_PX || width.saturating_mul(height) > MAX_PIXELS {
-        return Err(PdfError::TooLarge { width, height });
-    }
+    check_size(width, height)?;
 
     // A fresh cache per call: `RenderCache` is not `Send`, so it can't be shared.
     let cache = RenderCache::new();

@@ -4,6 +4,7 @@
 pub mod document;
 pub mod edit;
 pub mod error;
+pub mod export;
 pub mod pages;
 pub mod render;
 pub mod search;
