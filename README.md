@@ -15,7 +15,7 @@ No C libraries are involved (no PDFium, no MuPDF). Everything comes from crates.
 - Light and dark look, following the Windows setting.
 - The window never freezes while pages render; rendering happens on background threads.
 
-Your original file is never changed unless you choose Save and confirm "Overwrite". Save as writes a new file (suggested name: `<name>-edited.pdf`).
+Your original file is never changed unless you choose Save and confirm "Overwrite", or use Save as, pick the same file and confirm when Windows asks to replace it. Save as otherwise writes a new file (suggested name: `<name>-edited.pdf`).
 
 ## What it doesn't do
 
@@ -31,6 +31,8 @@ Known limits:
 - At very high zoom (around 600–800 %) pages look a little soft. Pages are drawn as one image and not in tiles.
 - It needs a graphics driver with OpenGL (it uses the `glow` backend of eframe). On a very old driver or a bare remote session it may not start.
 - Microsoft XPS Document Writer gets a `.pdf` file name suggestion in the "save print output" box. Rename it to `.oxps` if you use that printer.
+- Opening or saving a very large file, or one on a network drive, freezes the window briefly.
+- A PDF that's encrypted with an empty user password opens normally, but saving writes it without its encryption or permission restrictions.
 
 ## Build and run
 
@@ -89,6 +91,8 @@ cargo run --release --example probe -- file.pdf other.pdf
 
 It prints a few lines per file (page count, open time, render time per page, text extraction). Use it to see how fast a given PDF is.
 
+It prints document text only with `--show-text` (`cargo run --release --example probe -- --show-text file.pdf`); without it, it shows only how many characters page 1 has.
+
 ## Keyboard shortcuts
 
 | Keys | What it does |
@@ -116,6 +120,8 @@ It prints a few lines per file (page count, open time, render time per page, tex
 | Click, Ctrl+click, Shift+click on a thumbnail | Select one page / toggle a page / select a range |
 | Right-click a thumbnail | Menu: Delete, Export, Print for the selected pages |
 
+Ctrl+Z, Delete and the Ctrl zoom keys don't act on the document while a text field (find, zoom box) has focus.
+
 Shortcuts for things that aren't possible right now (for example Save with nothing changed) do nothing. Hover over a greyed button to see why it is disabled.
 
 ## Manual UI checklist
@@ -142,7 +148,7 @@ The automatic tests can't look at the screen, so this list is how to check the r
 
 10. The pages panel on the left shows thumbnails that fill in as you scroll. Drag its edge to resize it. Ctrl+B hides and shows it. The current page has an outline, and the panel follows when you scroll the main view.
 11. Click a thumbnail: the main view jumps to that page. Ctrl+click adds or removes a page from the selection. Shift+click selects a range. Ctrl+A selects all and Esc clears the selection.
-12. On a **copy**: select two pages and press Delete (or click the Delete button, which says "Delete 2 pages"). They disappear from the panel and the page count drops by two. The title gets a dot (`name.pdf •`) and the status bar shows `name.pdf (edited)`.
+12. On a **copy**: select two pages and press Delete (or click the Delete button, which says "Delete 2 pages"). They disappear from the panel and the page count drops by two. The title gets a dot (`name.pdf • — pdf-light`) and the status bar shows `name.pdf (edited)`.
 13. Press Ctrl+Z. The last delete comes back (one step at a time).
 14. Right-click a page that isn't selected. It becomes the selection and the menu shows "Delete page", "Export page…" and "Print page…". With several pages selected the labels say "3 pages".
 15. Click "Save as". A save box suggests `<name>-edited.pdf` in the same folder. Save. The status says "Saved <file>". Open that file in pdf-light and in another viewer: the page count and content are right, and the original file is unchanged (check its date and page count).
@@ -164,7 +170,7 @@ The automatic tests can't look at the screen, so this list is how to check the r
 25. Select 3 pages, press Ctrl+E (or Export…). The dialog opens with Pages set to "Selected". Choose PNG and 300 DPI, pick a folder, and click Export. The dialog shows `Exporting page 1 of 3` with a progress bar. The status then says "Exported 3 pages to <folder>".
 26. Open the PNG files in the Windows Photos app. They show the right pages, sharp, with names like `<name>_p001.png`.
 27. Export again as TIFF with "One multi-page TIFF" ticked. One `.tif` file appears, and Photos shows all 3 pages.
-28. Export to a folder that already has files with the same names. The dialog asks "Overwrite N existing files?" with Overwrite and Back (the exact wording of the buttons may differ).
+28. Export to a folder that already has files with the same names. The dialog asks "Overwrite N existing files?" with Overwrite and Back.
 29. Type a bad page range (for example `0` or `99`), a DPI of `5000`, or an empty file name. A red message appears under the field and Export is disabled.
 30. Start an export at 600 DPI of many pages and click Cancel part way. The status says "Export cancelled" and no files are left behind in the folder.
 

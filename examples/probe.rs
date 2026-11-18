@@ -1,6 +1,9 @@
 //! Feasibility probe: times opening, rendering and text extraction on real PDFs.
 //!
-//! Usage: `cargo run --release --example probe -- <file.pdf>...`
+//! Usage: `cargo run --release --example probe -- [--show-text] <file.pdf>...`
+//!
+//! Document text can be private, so page 1's text is only printed with `--show-text`;
+//! otherwise just its length is.
 
 use std::path::Path;
 use std::time::Instant;
@@ -17,7 +20,7 @@ fn ms(start: Instant) -> String {
 }
 
 /// Probes one file. Errors from opening bubble up to `main`, which prints them.
-fn probe(path: &Path) -> Result<(), pdf_light::error::PdfError> {
+fn probe(path: &Path, show_text: bool) -> Result<(), pdf_light::error::PdfError> {
     println!("file: {}", path.display());
 
     let t = Instant::now();
@@ -69,6 +72,7 @@ fn probe(path: &Path) -> Result<(), pdf_light::error::PdfError> {
     let t = Instant::now();
     let mut empty_pages = 0;
     let mut first_text = String::new();
+    let mut first_len = 0;
     for i in 0..measured {
         let glyphs = text::extract_glyphs(&pdf, i);
         let page_text = search::build_page_text(&glyphs);
@@ -76,6 +80,7 @@ fn probe(path: &Path) -> Result<(), pdf_light::error::PdfError> {
             empty_pages += 1;
         }
         if i == 0 {
+            first_len = page_text.chars.len();
             // The `String` annotation tells `collect` what to build from the chars.
             first_text = page_text
                 .chars
@@ -86,21 +91,33 @@ fn probe(path: &Path) -> Result<(), pdf_light::error::PdfError> {
         }
     }
     println!("text extraction total ({measured} page(s)): {}", ms(t));
-    println!("page 1 text (lowercased, first 200 chars): {first_text}");
+    if show_text {
+        println!("page 1 text (lowercased, first 200 chars): {first_text}");
+    } else {
+        println!("page 1 text: {first_len} chars (use --show-text to print it)");
+    }
     println!("pages without text (of {measured}): {empty_pages}");
     Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
-    let files: Vec<String> = std::env::args().skip(1).collect();
+    let mut show_text = false;
+    let mut files = Vec::new();
+    for arg in std::env::args().skip(1) {
+        if arg == "--show-text" {
+            show_text = true;
+        } else {
+            files.push(arg);
+        }
+    }
     if files.is_empty() {
-        eprintln!("usage: cargo run --release --example probe -- <file.pdf>...");
+        eprintln!("usage: cargo run --release --example probe -- [--show-text] <file.pdf>...");
         // Exit code 2 = bad usage; no second error message is printed.
         std::process::exit(2);
     }
     for file in &files {
         // `if let Err(e) = ...` runs the block only when the result is an error.
-        if let Err(e) = probe(Path::new(file)) {
+        if let Err(e) = probe(Path::new(file), show_text) {
             println!("failed to open: {e}");
         }
         println!();
