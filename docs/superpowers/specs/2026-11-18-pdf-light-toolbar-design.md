@@ -47,7 +47,7 @@ no all-caps labels.
 ```
 
 - Groups left-aligned in job order: **Pages** panel toggle (see "Pages panel") · **File** (Open, Save, Save as) · **Pages** (Delete, Undo) ·
-  **Find** (search field, previous/next, count) · **Export…**. Zoom is right-aligned. A thin Quiet
+  **Find** (search field, previous/next, count) · **Export… Print…**. Zoom is right-aligned. A thin Quiet
   separator between groups means "different job". When the window is narrow, the find field
   shrinks to a minimum of 120 px, and then the zoom group wraps to a second row.
 - Buttons are a 16 px icon plus a text label, frameless until hover (Panel shifts toward Ink by about
@@ -72,6 +72,28 @@ no all-caps labels.
   "Exported 3 pages to C:\…").
 - Empty state (no file): the desk shows "Open a PDF to start reading", an Open button, and the
   quiet line "or drop a file here".
+
+## Print (owner request: "add a print feature")
+
+This lifts printing out of the original design's non-goals.
+
+- **How:** Windows' own printing. The standard Windows print dialog (`PrintDlgExW`) picks the printer,
+  copies, collation, and All / Selection / Pages. pdf-light then renders each page itself with hayro at
+  the printer's resolution (capped at 600 DPI) and sends it to the printer as a bitmap through GDI
+  (`StartDocW` / `StartPage` / `StretchDIBits` / `EndPage` / `EndDoc`). It goes through the `windows`
+  crate (Rust bindings to Windows APIs), so the app stays pure Rust and nothing else gets installed.
+- **What prints:** the document as it currently looks. Deleted pages don't print, even before saving.
+  "Selection" in the dialog means the pages selected in the pages panel (offered only when some are
+  selected). "Pages" is a page range in the current numbering.
+- **Placement:** each page is scaled to fit the printable area, keeping its proportions, and centred. When
+  the page's orientation differs from the paper's (a landscape page on portrait paper), it is rotated 90°
+  to use the paper well. Pages are never enlarged past 100 % ("shrink to fit", not "stretch to fit").
+- **While printing:** rendering and spooling run on a background thread. The status bar shows
+  "Printing page 3 of 12" with a Cancel link; Cancel calls `AbortDoc`. Finished: "Sent 12 pages to
+  <printer name>". Errors use the error dialog: "Couldn't print: <reason>".
+- **Toolbar:** "Print…" (icon Print), next to "Export…" in an output group. Shortcut Ctrl+P. Tooltip
+  "Print pages (Ctrl+P)". Disabled with "Open a PDF first" when no file is open. Right-click on thumbnails
+  adds "Print page…" / "Print 3 pages…".
 
 ## Pages panel (owner request: "add a pages side panel")
 
@@ -129,6 +151,7 @@ The coordinates below are the design. Polylines are open unless marked closed.
 | Previous match | (10,3) (5,8) (10,13) | chevron left |
 | Next match | (6,3) (11,8) (6,13) | chevron right |
 | Export | bracket (9,3) (2,3) (2,13) (9,13); arrow (6,8)→(14.5,8); head (11.5,5) (14.5,8) (11.5,11) | send pages out |
+| Print | body closed (2,6.5) (14,6.5) (14,11.5) (2,11.5); paper in (4.5,6.5) (4.5,2) (11.5,2) (11.5,6.5); paper out closed (4.5,9.5) (11.5,9.5) (11.5,14.5) (4.5,14.5) | printer |
 | Zoom out | (3,8)→(13,8) | minus |
 | Zoom in | (3,8)→(13,8) and (8,3)→(8,13) | plus |
 | Fit width | bars (1.5,3)→(1.5,13) and (14.5,3)→(14.5,13); arrow (4,8)→(12,8); heads (6,6) (4,8) (6,10) and (10,6) (12,8) (10,10) | stretch to the edges |
