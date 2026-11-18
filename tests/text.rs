@@ -27,7 +27,6 @@ fn extract_glyphs_should_place_text_near_top_left() {
     let pdf = pdf_for(&["Hello world"]);
     let glyphs = extract_glyphs(&pdf, 0);
     let first = glyphs.first().expect("has glyphs").rect;
-    println!("first glyph rect: {first:?}");
     assert!((70.0..75.0).contains(&first.x0), "x0 = {}", first.x0);
     assert!((50.0..80.0).contains(&first.y0), "y0 = {}", first.y0);
 }
@@ -36,4 +35,10 @@ fn extract_glyphs_should_place_text_near_top_left() {
 fn extract_glyphs_should_return_nothing_for_blank_page() {
     let pdf = pdf_for(&[""]);
     assert!(extract_glyphs(&pdf, 0).is_empty());
+}
+
+#[test]
+fn extract_glyphs_should_return_nothing_for_out_of_range_page() {
+    let pdf = pdf_for(&["a"]);
+    assert!(extract_glyphs(&pdf, 5).is_empty());
 }

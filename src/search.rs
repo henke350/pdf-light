@@ -23,6 +23,10 @@ pub fn build_page_text(glyphs: &[TextGlyph]) -> PageText {
     let mut rects: Vec<PageRect> = Vec::new();
     let mut prev: Option<&TextGlyph> = None;
     for g in glyphs {
+        // `all` is true for an empty iterator, so skip empty text first.
+        if g.text.is_empty() {
+            continue;
+        }
         if g.text.chars().all(char::is_whitespace) {
             if chars.last() != Some(&' ') {
                 chars.push(' ');
@@ -52,7 +56,7 @@ pub fn build_page_text(glyphs: &[TextGlyph]) -> PageText {
 
 /// Lowercases, collapses whitespace runs to one space and trims.
 pub fn normalize_query(q: &str) -> Vec<char> {
-    let lower = q.to_lowercase();
+    let lower: String = q.chars().flat_map(char::to_lowercase).collect();
     // split_whitespace drops empty pieces, so joining gives single spaces.
     lower
         .split_whitespace()
@@ -190,5 +194,30 @@ mod tests {
     fn find_in_page_should_return_nothing_for_empty_query() {
         let page = build_page_text(&line("abc", 0.0));
         assert!(find_in_page(&page, &normalize_query("   ")).is_empty());
+    }
+
+    #[test]
+    fn find_in_page_should_match_greek_final_sigma() {
+        let page = build_page_text(&line("ΟΔΟΣ", 0.0));
+        assert_eq!(find_in_page(&page, &normalize_query("ΟΔΟΣ")).len(), 1);
+    }
+
+    #[test]
+    fn build_page_text_should_ignore_empty_glyph_text() {
+        let g = [
+            glyph("", 0.0, 0.0, 5.0, 10.0),
+            glyph("a", 5.0, 0.0, 10.0, 10.0),
+        ];
+        assert_eq!(chars_of(&g), "a");
+    }
+
+    #[test]
+    fn build_page_text_should_not_double_spaces() {
+        let g = [
+            glyph("a", 0.0, 0.0, 5.0, 10.0),
+            glyph(" ", 5.0, 0.0, 10.0, 10.0),
+            glyph("b", 30.0, 0.0, 35.0, 10.0),
+        ];
+        assert_eq!(chars_of(&g), "a b");
     }
 }

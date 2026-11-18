@@ -1,5 +1,15 @@
 //! Text with positions, read from a page's content stream.
 
+use hayro::hayro_syntax::Pdf;
+use hayro_interpret::font::{Glyph, GlyphRun};
+use hayro_interpret::hayro_cmap::BfString;
+use hayro_interpret::kurbo::{BezPath, Point, Rect, Shape};
+use hayro_interpret::util::TransformExt;
+use hayro_interpret::{
+    BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
+    InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
+};
+
 /// A rectangle on a page, in points, origin top-left, y pointing down.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PageRect {
@@ -15,16 +25,6 @@ pub struct TextGlyph {
     pub text: String,
     pub rect: PageRect,
 }
-
-use hayro::hayro_syntax::Pdf;
-use hayro_interpret::font::{Glyph, GlyphRun};
-use hayro_interpret::hayro_cmap::BfString;
-use hayro_interpret::kurbo::{BezPath, Point, Rect, Shape};
-use hayro_interpret::util::TransformExt;
-use hayro_interpret::{
-    BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
-    InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
-};
 
 /// Glyph box in glyph units (1000 per em): below the baseline to above the
 /// cap height, which gives a line-sized highlight.
@@ -87,7 +87,7 @@ impl<'a> Device<'a> for TextCollector {
             // Width: distance to the next glyph's origin, in glyph units.
             let next_gap = glyphs.get(i + 1).and_then(|next| {
                 let origin = t.inverse() * (props.transform * next.transform() * Point::ZERO);
-                (origin.x > 0.0).then_some(origin.x)
+                (origin.x.is_finite() && origin.x > 0.0).then_some(origin.x)
             });
             let width = next_gap.unwrap_or_else(|| match &**glyph {
                 Glyph::Type3(g) => g
