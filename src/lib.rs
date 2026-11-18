@@ -9,5 +9,6 @@ pub mod pages;
 pub mod render;
 pub mod render_pool;
 pub mod search;
+pub mod selection;
 pub mod text;
 pub mod view;

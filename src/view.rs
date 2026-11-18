@@ -158,6 +158,41 @@ pub fn render_scale(page_size: (f32, f32), wanted: f32, max_side: usize) -> f32 
     (scale * 64.0).floor().max(1.0) / 64.0
 }
 
+/// The sizes of the kept pages, in the order shown (`kept` holds original page indices).
+pub fn kept_sizes(sizes: &[(f32, f32)], kept: &[usize]) -> Vec<(f32, f32)> {
+    // `filter_map` drops the `None`s that `get` returns for indices out of range.
+    kept.iter()
+        .filter_map(|&page| sizes.get(page).copied())
+        .collect()
+}
+
+/// A thumbnail is at most this many times as tall as it is wide.
+const MAX_THUMBNAIL_ASPECT: f32 = 1.5;
+/// Thumbnails render for widths rounded up to this step, so dragging the
+/// panel's edge doesn't re-render them on every pixel.
+const THUMBNAIL_WIDTH_STEP: f32 = 32.0;
+
+/// A thumbnail's size for a page of `page_size` points in a column `width`
+/// pixels wide: as wide as the column, unless the page is so tall that the
+/// height limit makes it narrower.
+pub fn thumbnail_size(page_size: (f32, f32), width: f32) -> (f32, f32) {
+    let (page_width, page_height) = page_size;
+    if !(page_width > 0.0 && page_height > 0.0) {
+        // An empty or broken page: show an A4-shaped card.
+        return (width, width * std::f32::consts::SQRT_2);
+    }
+    let scale = (width / page_width).min(width * MAX_THUMBNAIL_ASPECT / page_height);
+    (page_width * scale, page_height * scale)
+}
+
+/// The render scale for a page's thumbnail in a column `width` logical pixels
+/// wide, sharp on a screen with `pixels_per_point` physical pixels per logical one.
+pub fn thumbnail_scale(page_size: (f32, f32), width: f32, pixels_per_point: f32) -> f32 {
+    let stepped = (width / THUMBNAIL_WIDTH_STEP).ceil() * THUMBNAIL_WIDTH_STEP;
+    let (thumbnail_width, _) = thumbnail_size(page_size, stepped);
+    thumbnail_width * pixels_per_point / page_size.0.max(1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +333,43 @@ mod tests {
         let zoomed = layout_pages(&[(100.0, 200.0), (100.0, 300.0)], 2.0, 10.0);
         // 50 px into page 2 at 1 px/pt is 100 px into it at 2 px/pt.
         assert_eq!(map_y(&two_pages(), &zoomed, 260.0), 510.0);
+    }
+
+    #[test]
+    fn kept_sizes_should_follow_kept_order() {
+        let sizes = [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)];
+        assert_eq!(kept_sizes(&sizes, &[0, 2]), vec![(1.0, 1.0), (3.0, 3.0)]);
+    }
+
+    #[test]
+    fn kept_sizes_should_skip_unknown_pages() {
+        assert_eq!(kept_sizes(&[(1.0, 1.0)], &[5]), vec![]);
+    }
+
+    #[test]
+    fn thumbnail_size_should_fill_width() {
+        assert_eq!(thumbnail_size((200.0, 100.0), 100.0), (100.0, 50.0));
+    }
+
+    #[test]
+    fn thumbnail_size_should_limit_very_tall_pages() {
+        assert_eq!(thumbnail_size((100.0, 400.0), 100.0), (37.5, 150.0));
+    }
+
+    #[test]
+    fn thumbnail_size_should_survive_empty_page() {
+        assert_eq!(thumbnail_size((0.0, 0.0), 100.0).0, 100.0);
+    }
+
+    #[test]
+    fn thumbnail_scale_should_render_at_screen_pixels() {
+        // 100 px rounds up to 128 px; at 2 physical pixels per point that is 4 × 64 pt.
+        assert_eq!(thumbnail_scale((64.0, 64.0), 100.0, 2.0), 4.0);
+    }
+
+    #[test]
+    fn thumbnail_scale_should_ignore_small_width_changes() {
+        let scale = |width| thumbnail_scale((612.0, 792.0), width, 1.0);
+        assert_eq!(scale(130.0), scale(150.0));
     }
 }

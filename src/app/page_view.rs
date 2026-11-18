@@ -1,18 +1,23 @@
 //! The scrolling page view: layout, texture cache, drawing, and scroll/zoom input.
 //!
-//! The UI thread only asks for pages and turns finished images into textures;
-//! the rendering itself happens in the `RenderPool`'s threads.
+//! The UI thread only says which pages it wants and turns finished images into
+//! textures; the rendering itself happens in the `RenderPool`'s threads.
+//!
+//! The view shows the kept pages in order. `sizes` and positions count those
+//! pages (0 = the first page shown); `pages[position]` is the page's index in
+//! the original file, which is what textures and render requests use.
 
 use super::icons::Icon;
+use super::textures::{self, TextureCache, TextureKey, texture_key};
 use super::theme::{self, LARGE_SIZE, TEXT_SIZE};
 use super::toolbar::ToolButton;
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, FontId, Key, Modifiers, Pos2, Rect, RichText, ScrollArea,
-    Sense, TextureHandle, TextureOptions, Vec2, pos2, vec2,
+    self, Align2, Color32, FontId, Key, Modifiers, Pos2, Rect, RichText, ScrollArea, Sense, Vec2,
+    pos2, vec2,
 };
-use pdf_light::render_pool::{RenderPool, RenderRequest, RenderResult};
+use pdf_light::render_pool::{RenderRequest, RenderResult};
 use pdf_light::view::{self, PageLayout};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// Space between pages, in logical pixels.
@@ -25,76 +30,6 @@ const TEXTURE_BUDGET: usize = 256 * 1024 * 1024;
 const ZOOM_SETTLE_SECS: f64 = 0.15;
 /// How far an arrow key scrolls, in logical pixels.
 const ARROW_STEP: f32 = 40.0;
-
-/// Cache key: page index and the render scale's bits (an `f32` can't be a hash key).
-type TextureKey = (usize, u32);
-
-fn texture_key(page: usize, scale: f32) -> TextureKey {
-    (page, scale.to_bits())
-}
-
-struct CachedTexture {
-    texture: TextureHandle,
-    scale: f32,
-    bytes: usize,
-    /// Frame number when it was last drawn, for least-recently-used eviction.
-    last_used: u64,
-}
-
-/// Page textures by (page, scale), kept under a memory budget.
-#[derive(Default)]
-struct TextureCache {
-    entries: HashMap<TextureKey, CachedTexture>,
-    total_bytes: usize,
-}
-
-impl TextureCache {
-    fn insert(&mut self, key: TextureKey, entry: CachedTexture) {
-        self.total_bytes += entry.bytes;
-        if let Some(old) = self.entries.insert(key, entry) {
-            self.total_bytes -= old.bytes;
-        }
-    }
-
-    fn contains(&self, key: TextureKey) -> bool {
-        self.entries.contains_key(&key)
-    }
-
-    fn has_any(&self, page: usize) -> bool {
-        self.entries.keys().any(|&(p, _)| p == page)
-    }
-
-    /// The texture of `page` closest to `scale` (the exact one if cached), marked as used.
-    fn best(&mut self, page: usize, scale: f32, frame: u64) -> Option<&TextureHandle> {
-        let distance = |entry: &CachedTexture| (entry.scale / scale).ln().abs();
-        let key = self
-            .entries
-            .iter()
-            .filter(|&(&(p, _), _)| p == page)
-            .min_by(|a, b| distance(a.1).total_cmp(&distance(b.1)))
-            .map(|(&key, _)| key)?;
-        let entry = self.entries.get_mut(&key)?;
-        entry.last_used = frame;
-        Some(&entry.texture)
-    }
-
-    /// Drops least-recently-used textures until under `budget`; textures drawn
-    /// in `frame` stay. Dropping a `TextureHandle` frees the GPU texture.
-    fn evict(&mut self, budget: usize, frame: u64) {
-        while self.total_bytes > budget {
-            let oldest = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| entry.last_used < frame)
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(&key, _)| key);
-            let Some(entry) = oldest.and_then(|key| self.entries.remove(&key)) else {
-                break;
-            };
-            self.total_bytes -= entry.bytes;
-        }
-    }
-}
 
 /// Scroll position, zoom and page images for one open document.
 pub struct PageView {
@@ -113,8 +48,8 @@ pub struct PageView {
     textures: TextureCache,
     /// Renders that failed; not asked for again.
     failed: HashSet<TextureKey>,
-    /// What was last handed to the pool, so it's only told about changes.
-    requested: Vec<RenderRequest>,
+    /// The renders this view would like next; see `wanted`.
+    wanted: Vec<RenderRequest>,
     frame: u64,
 }
 
@@ -130,7 +65,7 @@ impl PageView {
             current_page: 0,
             textures: TextureCache::default(),
             failed: HashSet::new(),
-            requested: Vec::new(),
+            wanted: Vec::new(),
             frame: 0,
         }
     }
@@ -140,39 +75,40 @@ impl PageView {
         self.current_page
     }
 
-    /// Turns a finished render into a texture (or remembers that it failed).
+    /// Turns a finished page render into a texture (or remembers that it failed).
     pub fn receive(&mut self, ctx: &egui::Context, result: RenderResult) {
         let RenderResult { request, result } = result;
-        if request.thumbnail {
-            return; // Thumbnails are drawn by the side panel (a later task).
-        }
         let key = texture_key(request.page, request.scale);
-        let max_side = ctx.input(|i| i.max_texture_side);
-        let image = result.ok().filter(|img| {
-            let (width, height) = (img.width as usize, img.height as usize);
-            width > 0
-                && height > 0
-                && width <= max_side
-                && height <= max_side
-                && img.rgba.len() == width * height * 4
-        });
-        let Some(image) = image else {
-            self.failed.insert(key);
-            return;
-        };
-        let size = [image.width as usize, image.height as usize];
-        let texture = ctx.load_texture(
-            format!("page-{}", request.page),
-            ColorImage::from_rgba_unmultiplied(size, &image.rgba),
-            TextureOptions::LINEAR,
-        );
-        let entry = CachedTexture {
-            texture,
-            scale: request.scale,
-            bytes: image.rgba.len(),
-            last_used: self.frame,
-        };
-        self.textures.insert(key, entry);
+        match textures::load(ctx, request, result, self.frame) {
+            Some(entry) => self.textures.insert(key, entry),
+            None => {
+                self.failed.insert(key);
+            }
+        }
+    }
+
+    /// The page renders this view would like next (original page indices),
+    /// in order: pages in view, then one after and one before.
+    pub fn wanted(&self) -> &[RenderRequest] {
+        &self.wanted
+    }
+
+    /// Forgets every page image, for when the page indices change meaning
+    /// (a save reopens the file). Zoom and scroll position stay.
+    pub fn reset_textures(&mut self) {
+        self.textures = TextureCache::default();
+        self.failed.clear();
+        self.wanted.clear();
+    }
+
+    /// Scrolls so the page at `position` starts at the top of the view.
+    pub fn scroll_to_page(&mut self, position: usize, sizes: &[(f32, f32)]) {
+        let layout = view::layout_pages(sizes, view::points_to_px(self.zoom), GAP);
+        if let Some(&top) = layout.tops.get(position) {
+            let x = self.scroll_to.unwrap_or(self.offset).x;
+            // The page sits `MARGIN` below its layout top, so that much desk stays above it.
+            self.scroll_to = Some(vec2(x, top));
+        }
     }
 
     /// Zoom in percent.
@@ -197,8 +133,9 @@ impl PageView {
         self.set_zoom(zoom, self.view_rect.size() / 2.0, sizes, now);
     }
 
-    /// Draws the pages, handles scrolling and zooming, and asks `pool` for the pages in view.
-    pub fn show(&mut self, ui: &mut egui::Ui, sizes: &[(f32, f32)], pool: &RenderPool) {
+    /// Draws the kept pages (`sizes` in points, `pages` their original indices),
+    /// handles scrolling and zooming, and works out which pages to render next.
+    pub fn show(&mut self, ui: &mut egui::Ui, sizes: &[(f32, f32)], pages: &[usize]) {
         self.frame += 1;
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
@@ -228,14 +165,14 @@ impl PageView {
         }
         let output = area.show_viewport(ui, |ui, viewport| {
             let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
-            self.paint_pages(ui, rect.min, &layout, viewport, content.x);
+            self.paint_pages(ui, rect.min, &layout, pages, viewport, content.x);
         });
         self.offset = output.state.clamped_offset();
         self.view_rect = output.inner_rect;
         self.current_page =
             view::current_page(&layout, self.offset.y - MARGIN, self.view_rect.height());
 
-        self.request_pages(&ctx, sizes, &layout, pool, now);
+        self.request_pages(&ctx, sizes, pages, &layout, now);
         self.textures.evict(TEXTURE_BUDGET, self.frame);
     }
 
@@ -324,16 +261,19 @@ impl PageView {
         ui: &egui::Ui,
         origin: Pos2,
         layout: &PageLayout,
+        pages: &[usize],
         viewport: Rect,
         content_width: f32,
     ) {
         let ppp = ui.ctx().pixels_per_point();
         let target_scale = view::points_to_px(self.zoom) * ppp;
         let painter = ui.painter();
-        for page in view::visible_range(layout, viewport.min.y - MARGIN, viewport.height()) {
-            let (Some(&(width, height)), Some(&top)) =
-                (layout.sizes.get(page), layout.tops.get(page))
-            else {
+        for position in view::visible_range(layout, viewport.min.y - MARGIN, viewport.height()) {
+            let (Some(&(width, height)), Some(&top), Some(&page)) = (
+                layout.sizes.get(position),
+                layout.tops.get(position),
+                pages.get(position),
+            ) else {
                 continue;
             };
             let min = origin + vec2((content_width - width) / 2.0, MARGIN + top);
@@ -366,13 +306,13 @@ impl PageView {
         }
     }
 
-    /// Asks the pool for the pages in view, then one after and one before.
+    /// Lists the pages in view, then one after and one before, that still need rendering.
     fn request_pages(
         &mut self,
         ctx: &egui::Context,
         sizes: &[(f32, f32)],
+        pages: &[usize],
         layout: &PageLayout,
-        pool: &RenderPool,
         now: f64,
     ) {
         let settling = now - self.zoom_changed_at;
@@ -386,9 +326,9 @@ impl PageView {
         let visible = view::visible_range(layout, self.offset.y - MARGIN, self.view_rect.height());
         let next = (visible.end < sizes.len()).then_some(visible.end);
         let previous = visible.start.checked_sub(1);
-        let mut wanted = Vec::new();
-        for page in visible.chain(next).chain(previous) {
-            let Some(&size) = sizes.get(page) else {
+        self.wanted.clear();
+        for position in visible.chain(next).chain(previous) {
+            let (Some(&size), Some(&page)) = (sizes.get(position), pages.get(position)) else {
                 continue;
             };
             let scale = view::render_scale(size, wanted_scale, max_side);
@@ -397,16 +337,12 @@ impl PageView {
             // While zooming, pages that already show something wait for the zoom to settle.
             let wait = !settled && self.textures.has_any(page);
             if !done && !wait {
-                wanted.push(RenderRequest {
+                self.wanted.push(RenderRequest {
                     page,
                     scale,
                     thumbnail: false,
                 });
             }
-        }
-        if wanted != self.requested {
-            pool.set_wanted(wanted.clone());
-            self.requested = wanted;
         }
     }
 }

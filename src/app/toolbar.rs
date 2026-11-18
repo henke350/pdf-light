@@ -94,10 +94,7 @@ const NOT_BUILT_YET: &str = "Not built yet";
 fn not_built_yet(action: ToolbarAction) -> bool {
     matches!(
         action,
-        ToolbarAction::TogglePagesPanel
-            | ToolbarAction::Save
-            | ToolbarAction::SaveAs
-            | ToolbarAction::FindNext
+        ToolbarAction::FindNext
             | ToolbarAction::FindPrevious
             | ToolbarAction::Export
             | ToolbarAction::Print
@@ -443,7 +440,7 @@ fn shortcut_actions(ctx: &egui::Context, state: &ToolbarState) -> Vec<ToolbarAct
         (Modifiers::NONE, Key::F3, A::FindNext),
     ];
     // While typing in a field, these keys belong to the field.
-    if !ctx.egui_wants_keyboard_input() {
+    if !ctx.text_edit_focused() {
         shortcuts.extend([
             (ctrl, Key::Z, A::Undo),
             (Modifiers::NONE, Key::Delete, A::DeleteSelected),
@@ -790,6 +787,35 @@ mod tests {
                 Some("A PDF needs at least one page"),
                 None
             ]
+        );
+    }
+
+    #[test]
+    fn disabled_reason_should_allow_page_editing_and_saving() {
+        let state = ToolbarState {
+            is_modified: true,
+            can_undo: true,
+            ..document(2, 5)
+        };
+        let actions = [
+            ToolbarAction::TogglePagesPanel,
+            ToolbarAction::Save,
+            ToolbarAction::SaveAs,
+            ToolbarAction::DeleteSelected,
+            ToolbarAction::Undo,
+        ];
+        let reasons: Vec<_> = actions
+            .into_iter()
+            .map(|action| disabled_reason(action, &state))
+            .collect();
+        assert_eq!(reasons, vec![None; actions.len()]);
+    }
+
+    #[test]
+    fn disabled_reason_should_keep_save_as_without_changes() {
+        assert_eq!(
+            disabled_reason(ToolbarAction::SaveAs, &document(0, 5)),
+            None
         );
     }
 
