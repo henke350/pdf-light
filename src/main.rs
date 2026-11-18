@@ -10,7 +10,7 @@ impl eframe::App for PdfLightApp {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 }
 
-// `Result` means "this can fail"; `?`-style handling lets us pass errors up to the caller.
+// `Result` means "this can fail". Returning it from `main` makes the program exit with an error code if the window fails to start.
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("pdf-light"),
