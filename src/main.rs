@@ -12,7 +12,8 @@ fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("pdf-light")
-            .with_inner_size([900.0, 760.0])
+            // Wide enough for the toolbar with every label (narrower windows drop them).
+            .with_inner_size([1180.0, 760.0])
             .with_drag_and_drop(true),
         // OpenGL starts faster and makes a smaller exe than wgpu (see Cargo.toml).
         renderer: eframe::Renderer::Glow,

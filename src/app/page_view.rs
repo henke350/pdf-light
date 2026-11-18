@@ -3,17 +3,18 @@
 //! The UI thread only asks for pages and turns finished images into textures;
 //! the rendering itself happens in the `RenderPool`'s threads.
 
+use super::icons::Icon;
+use super::theme::{self, LARGE_SIZE, TEXT_SIZE};
+use super::toolbar::ToolButton;
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, FontId, Key, Modifiers, Pos2, Rect, ScrollArea, Sense,
-    TextureHandle, TextureOptions, Vec2, pos2, vec2,
+    self, Align2, Color32, ColorImage, FontId, Key, Modifiers, Pos2, Rect, RichText, ScrollArea,
+    Sense, TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
 use pdf_light::render_pool::{RenderPool, RenderRequest, RenderResult};
 use pdf_light::view::{self, PageLayout};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-/// Colour behind the pages.
-pub const BACKGROUND: Color32 = Color32::from_gray(88);
 /// Space between pages, in logical pixels.
 const GAP: f32 = 12.0;
 /// Space around the pages, in logical pixels.
@@ -101,8 +102,6 @@ pub struct PageView {
     zoom: f32,
     /// Keep the zoom at "fit width" as the window changes size.
     fit_width: bool,
-    /// What the zoom box shows (and what the owner is typing into it).
-    zoom_text: String,
     /// `ctx.input(|i| i.time)` of the last zoom change.
     zoom_changed_at: f64,
     /// Scroll position to apply on the next frame.
@@ -124,7 +123,6 @@ impl PageView {
         Self {
             zoom: 100.0,
             fit_width: true,
-            zoom_text: "100%".to_owned(),
             zoom_changed_at: f64::NEG_INFINITY,
             scroll_to: None,
             offset: Vec2::ZERO,
@@ -177,43 +175,26 @@ impl PageView {
         self.textures.insert(key, entry);
     }
 
-    /// The − / zoom box / + / Fit width controls for the toolbar.
-    pub fn zoom_controls(&mut self, ui: &mut egui::Ui, sizes: &[(f32, f32)]) {
-        let now = ui.input(|i| i.time);
-        let center = self.view_rect.size() / 2.0;
-        if ui
-            .button("−")
-            .on_hover_text("Zoom out (Ctrl+minus)")
-            .clicked()
-        {
-            self.fit_width = false;
-            self.set_zoom(view::zoom_out_step(self.zoom), center, sizes, now);
-        }
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut self.zoom_text)
-                .desired_width(48.0)
-                .align(Align2::CENTER_CENTER),
-        );
-        if response.lost_focus() {
-            match view::parse_zoom(&self.zoom_text) {
-                Some(zoom) => {
-                    self.fit_width = false;
-                    self.set_zoom(zoom, center, sizes, now);
-                }
-                None => self.zoom_text = zoom_label(self.zoom),
-            }
-        }
-        if ui
-            .button("+")
-            .on_hover_text("Zoom in (Ctrl+plus)")
-            .clicked()
-        {
-            self.fit_width = false;
-            self.set_zoom(view::zoom_in_step(self.zoom), center, sizes, now);
-        }
-        if ui.selectable_label(self.fit_width, "Fit width").clicked() {
-            self.fit_width = true;
-        }
+    /// Zoom in percent.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Whether the zoom follows the window width.
+    pub fn fits_width(&self) -> bool {
+        self.fit_width
+    }
+
+    /// Keeps the widest page as wide as the window from now on.
+    pub fn fit_width(&mut self) {
+        self.fit_width = true;
+    }
+
+    /// Zooms to `zoom` percent (clamped) around the middle of the view,
+    /// and stops fitting the width.
+    pub fn zoom_to(&mut self, zoom: f32, sizes: &[(f32, f32)], now: f64) {
+        self.fit_width = false;
+        self.set_zoom(zoom, self.view_rect.size() / 2.0, sizes, now);
     }
 
     /// Draws the pages, handles scrolling and zooming, and asks `pool` for the pages in view.
@@ -281,43 +262,19 @@ impl PageView {
 
         self.scroll_to = Some(vec2(x, y).max(Vec2::ZERO));
         self.zoom = zoom;
-        self.zoom_text = zoom_label(zoom);
         self.zoom_changed_at = now;
     }
 
-    /// Ctrl+wheel (or a touchpad pinch) over the pages, and Ctrl+plus/minus.
+    /// Ctrl+wheel (or a touchpad pinch) over the pages zooms around the pointer.
+    /// (Ctrl+plus/minus come through the toolbar as `ToolbarAction`s.)
     fn zoom_input(&mut self, ctx: &egui::Context, sizes: &[(f32, f32)], now: f64) {
         let (delta, pointer) = ctx.input(|i| (i.zoom_delta(), i.pointer.hover_pos()));
-        let over_view = pointer.filter(|&p| self.view_rect.contains(p));
-        let anchor = over_view.map_or(self.view_rect.size() / 2.0, |p| p - self.view_rect.min);
-        if delta != 1.0 && over_view.is_some() {
+        let Some(pointer) = pointer.filter(|&p| self.view_rect.contains(p)) else {
+            return;
+        };
+        if delta != 1.0 {
             self.fit_width = false;
-            self.set_zoom(self.zoom * delta, anchor, sizes, now);
-        }
-
-        if ctx.egui_wants_keyboard_input() {
-            return; // Typing in the zoom box.
-        }
-        // Count every press this frame (key repeat can deliver several at once).
-        let (steps_in, steps_out) = ctx.input_mut(|i| {
-            // Ctrl+= also zooms in, so Shift isn't needed on US keyboards.
-            let steps_in = i.count_and_consume_key(Modifiers::COMMAND, Key::Plus)
-                + i.count_and_consume_key(Modifiers::COMMAND, Key::Equals);
-            (
-                steps_in,
-                i.count_and_consume_key(Modifiers::COMMAND, Key::Minus),
-            )
-        });
-        if steps_in + steps_out > 0 {
-            let mut zoom = self.zoom;
-            for _ in 0..steps_in {
-                zoom = view::zoom_in_step(zoom);
-            }
-            for _ in 0..steps_out {
-                zoom = view::zoom_out_step(zoom);
-            }
-            self.fit_width = false;
-            self.set_zoom(zoom, anchor, sizes, now);
+            self.set_zoom(self.zoom * delta, pointer - self.view_rect.min, sizes, now);
         }
     }
 
@@ -454,9 +411,44 @@ impl PageView {
     }
 }
 
-/// "125%" for a zoom of 125.
-fn zoom_label(zoom: f32) -> String {
-    format!("{zoom:.0}%")
+/// About how tall the empty state's three lines are, to centre them.
+const EMPTY_STATE_HEIGHT: f32 = 100.0;
+
+/// The desk with no file open: "Open a PDF to start reading", an Open button
+/// and the quiet line "or drop a file here". Returns `true` when Open is clicked.
+pub fn empty_state(ui: &mut egui::Ui) -> bool {
+    let palette = theme::palette(ui.ctx());
+    let text = palette.on_desk();
+    ui.add_space(((ui.available_height() - EMPTY_STATE_HEIGHT) / 2.0).max(0.0));
+    ui.vertical_centered(|ui| {
+        ui.label(
+            RichText::new("Open a PDF to start reading")
+                .size(LARGE_SIZE)
+                .color(text),
+        );
+        ui.add_space(14.0);
+        let open = ui
+            .add(ToolButton {
+                icon: Icon::Open,
+                label: Some("Open"),
+                name: "Open",
+                active: false,
+                danger_on_hover: false,
+                filled: true,
+                palette,
+            })
+            .on_hover_text("Open a PDF (Ctrl+O)");
+        ui.add_space(10.0);
+        // Quiet on the desk: the desk's text colour, faded toward the desk.
+        let quiet = palette.desk.lerp_to_gamma(text, 0.7);
+        ui.label(
+            RichText::new("or drop a file here")
+                .size(TEXT_SIZE)
+                .color(quiet),
+        );
+        open.clicked()
+    })
+    .inner
 }
 
 /// Content is as wide as the widest page plus margins, or the view if wider.
