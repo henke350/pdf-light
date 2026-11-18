@@ -107,6 +107,36 @@ pub fn current_page(layout: &PageLayout, scroll_top: f32, viewport_height: f32) 
     page_at(layout, scroll_top + viewport_height * progress)
 }
 
+/// The scroll position (as `current_page`'s `scroll_top`) for going to `page`:
+/// the page's top `margin` pixels below the top of the view, moved only as far
+/// as needed for `current_page` to report that page. (Its reference line can
+/// otherwise fall just above the page early in a long document, or pages
+/// below it when several pages fit in the view.) `None` if there is no such page.
+pub fn scroll_top_for_page(
+    layout: &PageLayout,
+    page: usize,
+    viewport_height: f32,
+    margin: f32,
+) -> Option<f32> {
+    let (&top, &(_, height)) = layout.tops.get(page).zip(layout.sizes.get(page))?;
+    let preferred = (top - margin).max(0.0);
+    let scroll_range = layout.total_height - viewport_height;
+    if scroll_range <= 0.0 {
+        return Some(preferred); // Everything fits; there is nothing to scroll.
+    }
+    let preferred = preferred.min(scroll_range);
+    // Within `0..=scroll_range`, `current_page`'s line sits at `scroll_top * scale`.
+    let scale = layout.total_height / scroll_range;
+    let line = preferred * scale;
+    // Stay a little inside the page, so rounding can't tip the line into the gap.
+    let inset = (height / 4.0).min(8.0);
+    let (first, last) = (top + inset, top + height - inset);
+    if (first..=last).contains(&line) {
+        return Some(preferred);
+    }
+    Some((line.clamp(first, last) / scale).clamp(0.0, scroll_range))
+}
+
 /// The last page whose top is at or above `y` (the first page if none is).
 fn page_at(layout: &PageLayout, y: f32) -> usize {
     layout
@@ -292,6 +322,40 @@ mod tests {
         let layout = layout_pages(&[(100.0, 100.0); 3], 1.0, 10.0);
         // 320 px of pages in a 300 px view, scrolled to the bottom.
         assert_eq!(current_page(&layout, 20.0, 300.0), 2);
+    }
+
+    /// `current_page` after going to `page` with `scroll_top_for_page`.
+    fn page_after_going_to(layout: &PageLayout, page: usize, viewport_height: f32) -> usize {
+        let scroll_top =
+            scroll_top_for_page(layout, page, viewport_height, 8.0).expect("page exists");
+        current_page(layout, scroll_top, viewport_height)
+    }
+
+    #[test]
+    fn scroll_top_for_page_should_report_that_page_early_in_a_long_document() {
+        // 2000 tall pages: near the start the reference line sits only a few
+        // pixels below the top of the view.
+        let layout = layout_pages(&[(1000.0, 1414.0); 2000], 1.0, 12.0);
+        assert_eq!(page_after_going_to(&layout, 10, 900.0), 10);
+    }
+
+    #[test]
+    fn scroll_top_for_page_should_report_that_page_at_low_zoom() {
+        // Small pages, several in view: late in the document the reference
+        // line sits far below the top of the view.
+        let layout = layout_pages(&[(150.0, 212.0); 100], 1.0, 12.0);
+        assert_eq!(page_after_going_to(&layout, 70, 900.0), 70);
+    }
+
+    #[test]
+    fn scroll_top_for_page_should_put_page_at_top_when_that_already_works() {
+        let layout = layout_pages(&[(100.0, 1000.0); 3], 1.0, 12.0);
+        assert_eq!(scroll_top_for_page(&layout, 1, 300.0, 8.0), Some(1004.0));
+    }
+
+    #[test]
+    fn scroll_top_for_page_should_reject_unknown_page() {
+        assert_eq!(scroll_top_for_page(&two_pages(), 5, 100.0, 8.0), None);
     }
 
     #[test]

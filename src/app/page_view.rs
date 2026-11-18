@@ -101,13 +101,16 @@ impl PageView {
         self.wanted.clear();
     }
 
-    /// Scrolls so the page at `position` starts at the top of the view.
+    /// Scrolls to the page at `position`: at the top of the view where that
+    /// keeps it the current page, otherwise as close to the top as it can be.
     pub fn scroll_to_page(&mut self, position: usize, sizes: &[(f32, f32)]) {
         let layout = view::layout_pages(sizes, view::points_to_px(self.zoom), GAP);
-        if let Some(&top) = layout.tops.get(position) {
+        let height = self.view_rect.height();
+        if let Some(scroll_top) = view::scroll_top_for_page(&layout, position, height, MARGIN) {
             let x = self.scroll_to.unwrap_or(self.offset).x;
-            // The page sits `MARGIN` below its layout top, so that much desk stays above it.
-            self.scroll_to = Some(vec2(x, top));
+            // `show` measures `scroll_top` from the first page, which sits `MARGIN`
+            // below the content's top.
+            self.scroll_to = Some(vec2(x, scroll_top + MARGIN));
         }
     }
 
