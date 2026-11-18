@@ -93,9 +93,18 @@ pub fn zoom_out_step(zoom: f32) -> f32 {
         .unwrap_or(MIN_ZOOM)
 }
 
-/// The page shown at the middle of the viewport (for "page N of M").
+/// The page to report as "page N of M". It is the page under a line that
+/// moves from the top of the viewport (at the start of the document) to the
+/// bottom (at the end), so the first and last pages are reached even when
+/// several pages fit in the window.
 pub fn current_page(layout: &PageLayout, scroll_top: f32, viewport_height: f32) -> usize {
-    page_at(layout, scroll_top + viewport_height / 2.0)
+    let scroll_range = layout.total_height - viewport_height;
+    let progress = if scroll_range > 0.0 {
+        (scroll_top / scroll_range).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    page_at(layout, scroll_top + viewport_height * progress)
 }
 
 /// The last page whose top is at or above `y` (the first page if none is).
@@ -121,6 +130,31 @@ pub fn map_y(old: &PageLayout, new: &PageLayout, y: f32) -> f32 {
         return new_top;
     }
     new_top + (y - old_top) * new_height / old_height
+}
+
+/// Reads a zoom typed into the zoom box, such as "150", "150%" or " 75 % ".
+/// The result is not clamped; `None` if it isn't a positive number.
+pub fn parse_zoom(text: &str) -> Option<f32> {
+    let number = text.trim().trim_end_matches('%').trim();
+    // `.ok()` turns the parse `Result` into an `Option`, dropping the error.
+    let zoom: f32 = number.parse().ok()?;
+    (zoom.is_finite() && zoom > 0.0).then_some(zoom)
+}
+
+/// Largest page image the reading view asks for, in pixels (64 MB of RGBA).
+pub const MAX_TEXTURE_PIXELS: f32 = 16_000_000.0;
+
+/// The scale to render a page of `page_size` points at, given the `wanted`
+/// scale: rounded down to a multiple of 1/64 (so nearby zooms share images) and
+/// capped so the image stays within `max_side` pixels per side and
+/// `MAX_TEXTURE_PIXELS` in total. At extreme zoom the page is then drawn
+/// stretched rather than not at all.
+pub fn render_scale(page_size: (f32, f32), wanted: f32, max_side: usize) -> f32 {
+    let (width, height) = (page_size.0.max(1.0), page_size.1.max(1.0));
+    let side_cap = max_side as f32 / width.max(height);
+    let pixel_cap = (MAX_TEXTURE_PIXELS / (width * height)).sqrt();
+    let scale = wanted.min(side_cap).min(pixel_cap);
+    (scale * 64.0).floor().max(1.0) / 64.0
 }
 
 #[cfg(test)]
@@ -208,13 +242,54 @@ mod tests {
     }
 
     #[test]
-    fn current_page_should_pick_page_at_viewport_middle() {
+    fn current_page_should_follow_scrolling() {
         assert_eq!(current_page(&two_pages(), 200.0, 100.0), 1);
     }
 
     #[test]
     fn current_page_should_start_at_first_page() {
         assert_eq!(current_page(&two_pages(), 0.0, 100.0), 0);
+    }
+
+    #[test]
+    fn current_page_should_reach_a_short_last_page_at_the_end() {
+        let layout = layout_pages(&[(100.0, 100.0); 3], 1.0, 10.0);
+        // 320 px of pages in a 300 px view, scrolled to the bottom.
+        assert_eq!(current_page(&layout, 20.0, 300.0), 2);
+    }
+
+    #[test]
+    fn parse_zoom_should_accept_percent_sign_and_spaces() {
+        assert_eq!(parse_zoom(" 75 % "), Some(75.0));
+    }
+
+    #[test]
+    fn parse_zoom_should_reject_text_and_non_positive_numbers() {
+        assert_eq!(
+            (parse_zoom("abc"), parse_zoom("0"), parse_zoom("NaN")),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn render_scale_should_round_down_to_64ths() {
+        assert_eq!(render_scale((612.0, 792.0), 1.34, 16384), 85.0 / 64.0);
+    }
+
+    #[test]
+    fn render_scale_should_respect_max_side() {
+        assert_eq!(render_scale((612.0, 792.0), 8.0, 2048), 165.0 / 64.0);
+    }
+
+    #[test]
+    fn render_scale_should_respect_pixel_budget() {
+        let scale = render_scale((612.0, 792.0), 8.0, 65536);
+        assert!(612.0 * 792.0 * scale * scale <= MAX_TEXTURE_PIXELS);
+    }
+
+    #[test]
+    fn render_scale_should_stay_positive_for_huge_pages() {
+        assert_eq!(render_scale((1e9, 1e9), 1.0, 2048), 1.0 / 64.0);
     }
 
     #[test]

@@ -1,0 +1,472 @@
+//! The scrolling page view: layout, texture cache, drawing, and scroll/zoom input.
+//!
+//! The UI thread only asks for pages and turns finished images into textures;
+//! the rendering itself happens in the `RenderPool`'s threads.
+
+use eframe::egui::{
+    self, Align2, Color32, ColorImage, FontId, Key, Modifiers, Pos2, Rect, ScrollArea, Sense,
+    TextureHandle, TextureOptions, Vec2, pos2, vec2,
+};
+use pdf_light::render_pool::{RenderPool, RenderRequest, RenderResult};
+use pdf_light::view::{self, PageLayout};
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+/// Colour behind the pages.
+pub const BACKGROUND: Color32 = Color32::from_gray(88);
+/// Space between pages, in logical pixels.
+const GAP: f32 = 12.0;
+/// Space around the pages, in logical pixels.
+const MARGIN: f32 = 8.0;
+/// Most memory the page textures may use before old ones are dropped.
+const TEXTURE_BUDGET: usize = 256 * 1024 * 1024;
+/// While zooming, wait this long before asking for sharper images.
+const ZOOM_SETTLE_SECS: f64 = 0.15;
+/// How far an arrow key scrolls, in logical pixels.
+const ARROW_STEP: f32 = 40.0;
+
+/// Cache key: page index and the render scale's bits (an `f32` can't be a hash key).
+type TextureKey = (usize, u32);
+
+fn texture_key(page: usize, scale: f32) -> TextureKey {
+    (page, scale.to_bits())
+}
+
+struct CachedTexture {
+    texture: TextureHandle,
+    scale: f32,
+    bytes: usize,
+    /// Frame number when it was last drawn, for least-recently-used eviction.
+    last_used: u64,
+}
+
+/// Page textures by (page, scale), kept under a memory budget.
+#[derive(Default)]
+struct TextureCache {
+    entries: HashMap<TextureKey, CachedTexture>,
+    total_bytes: usize,
+}
+
+impl TextureCache {
+    fn insert(&mut self, key: TextureKey, entry: CachedTexture) {
+        self.total_bytes += entry.bytes;
+        if let Some(old) = self.entries.insert(key, entry) {
+            self.total_bytes -= old.bytes;
+        }
+    }
+
+    fn contains(&self, key: TextureKey) -> bool {
+        self.entries.contains_key(&key)
+    }
+
+    fn has_any(&self, page: usize) -> bool {
+        self.entries.keys().any(|&(p, _)| p == page)
+    }
+
+    /// The texture of `page` closest to `scale` (the exact one if cached), marked as used.
+    fn best(&mut self, page: usize, scale: f32, frame: u64) -> Option<&TextureHandle> {
+        let distance = |entry: &CachedTexture| (entry.scale / scale).ln().abs();
+        let key = self
+            .entries
+            .iter()
+            .filter(|&(&(p, _), _)| p == page)
+            .min_by(|a, b| distance(a.1).total_cmp(&distance(b.1)))
+            .map(|(&key, _)| key)?;
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = frame;
+        Some(&entry.texture)
+    }
+
+    /// Drops least-recently-used textures until under `budget`; textures drawn
+    /// in `frame` stay. Dropping a `TextureHandle` frees the GPU texture.
+    fn evict(&mut self, budget: usize, frame: u64) {
+        while self.total_bytes > budget {
+            let oldest = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.last_used < frame)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(&key, _)| key);
+            let Some(entry) = oldest.and_then(|key| self.entries.remove(&key)) else {
+                break;
+            };
+            self.total_bytes -= entry.bytes;
+        }
+    }
+}
+
+/// Scroll position, zoom and page images for one open document.
+pub struct PageView {
+    /// Zoom in percent.
+    zoom: f32,
+    /// Keep the zoom at "fit width" as the window changes size.
+    fit_width: bool,
+    /// What the zoom box shows (and what the owner is typing into it).
+    zoom_text: String,
+    /// `ctx.input(|i| i.time)` of the last zoom change.
+    zoom_changed_at: f64,
+    /// Scroll position to apply on the next frame.
+    scroll_to: Option<Vec2>,
+    /// Last frame's scroll position and on-screen area.
+    offset: Vec2,
+    view_rect: Rect,
+    current_page: usize,
+    textures: TextureCache,
+    /// Renders that failed; not asked for again.
+    failed: HashSet<TextureKey>,
+    /// What was last handed to the pool, so it's only told about changes.
+    requested: Vec<RenderRequest>,
+    frame: u64,
+}
+
+impl PageView {
+    pub fn new() -> Self {
+        Self {
+            zoom: 100.0,
+            fit_width: true,
+            zoom_text: "100%".to_owned(),
+            zoom_changed_at: f64::NEG_INFINITY,
+            scroll_to: None,
+            offset: Vec2::ZERO,
+            view_rect: Rect::ZERO,
+            current_page: 0,
+            textures: TextureCache::default(),
+            failed: HashSet::new(),
+            requested: Vec::new(),
+            frame: 0,
+        }
+    }
+
+    /// The page for "page N of M" (0-based); see `view::current_page`.
+    pub fn current_page(&self) -> usize {
+        self.current_page
+    }
+
+    /// Turns a finished render into a texture (or remembers that it failed).
+    pub fn receive(&mut self, ctx: &egui::Context, result: RenderResult) {
+        let RenderResult { request, result } = result;
+        if request.thumbnail {
+            return; // Thumbnails are drawn by the side panel (a later task).
+        }
+        let key = texture_key(request.page, request.scale);
+        let max_side = ctx.input(|i| i.max_texture_side);
+        let image = result.ok().filter(|img| {
+            let (width, height) = (img.width as usize, img.height as usize);
+            width > 0
+                && height > 0
+                && width <= max_side
+                && height <= max_side
+                && img.rgba.len() == width * height * 4
+        });
+        let Some(image) = image else {
+            self.failed.insert(key);
+            return;
+        };
+        let size = [image.width as usize, image.height as usize];
+        let texture = ctx.load_texture(
+            format!("page-{}", request.page),
+            ColorImage::from_rgba_unmultiplied(size, &image.rgba),
+            TextureOptions::LINEAR,
+        );
+        let entry = CachedTexture {
+            texture,
+            scale: request.scale,
+            bytes: image.rgba.len(),
+            last_used: self.frame,
+        };
+        self.textures.insert(key, entry);
+    }
+
+    /// The − / zoom box / + / Fit width controls for the toolbar.
+    pub fn zoom_controls(&mut self, ui: &mut egui::Ui, sizes: &[(f32, f32)]) {
+        let now = ui.input(|i| i.time);
+        let center = self.view_rect.size() / 2.0;
+        if ui
+            .button("−")
+            .on_hover_text("Zoom out (Ctrl+minus)")
+            .clicked()
+        {
+            self.fit_width = false;
+            self.set_zoom(view::zoom_out_step(self.zoom), center, sizes, now);
+        }
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.zoom_text)
+                .desired_width(48.0)
+                .align(Align2::CENTER_CENTER),
+        );
+        if response.lost_focus() {
+            match view::parse_zoom(&self.zoom_text) {
+                Some(zoom) => {
+                    self.fit_width = false;
+                    self.set_zoom(zoom, center, sizes, now);
+                }
+                None => self.zoom_text = zoom_label(self.zoom),
+            }
+        }
+        if ui
+            .button("+")
+            .on_hover_text("Zoom in (Ctrl+plus)")
+            .clicked()
+        {
+            self.fit_width = false;
+            self.set_zoom(view::zoom_in_step(self.zoom), center, sizes, now);
+        }
+        if ui.selectable_label(self.fit_width, "Fit width").clicked() {
+            self.fit_width = true;
+        }
+    }
+
+    /// Draws the pages, handles scrolling and zooming, and asks `pool` for the pages in view.
+    pub fn show(&mut self, ui: &mut egui::Ui, sizes: &[(f32, f32)], pool: &RenderPool) {
+        self.frame += 1;
+        let ctx = ui.ctx().clone();
+        let now = ctx.input(|i| i.time);
+        let available = ui.available_rect_before_wrap();
+        if self.view_rect == Rect::ZERO {
+            self.view_rect = available;
+        }
+
+        if self.fit_width {
+            let widest = sizes.iter().map(|s| s.0).fold(0.0, f32::max);
+            let zoom = view::fit_width_zoom(widest, available.width(), 2.0 * MARGIN);
+            self.set_zoom(zoom, vec2(available.width() / 2.0, 0.0), sizes, now);
+        }
+        self.zoom_input(&ctx, sizes, now);
+
+        let layout = view::layout_pages(sizes, view::points_to_px(self.zoom), GAP);
+        let content = vec2(
+            content_width(&layout, available.width()),
+            layout.total_height + 2.0 * MARGIN,
+        );
+        self.scroll_keys(&ctx, content.y);
+
+        let mut area = ScrollArea::both().id_salt("pages").auto_shrink(false);
+        if let Some(offset) = self.scroll_to.take() {
+            let max = (content - available.size()).max(Vec2::ZERO);
+            area = area.scroll_offset(offset.clamp(Vec2::ZERO, max));
+        }
+        let output = area.show_viewport(ui, |ui, viewport| {
+            let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
+            self.paint_pages(ui, rect.min, &layout, viewport, content.x);
+        });
+        self.offset = output.state.clamped_offset();
+        self.view_rect = output.inner_rect;
+        self.current_page =
+            view::current_page(&layout, self.offset.y - MARGIN, self.view_rect.height());
+
+        self.request_pages(&ctx, sizes, &layout, pool, now);
+        self.textures.evict(TEXTURE_BUDGET, self.frame);
+    }
+
+    /// Changes the zoom so the content point at `anchor` (relative to the
+    /// view's top-left corner) stays under it.
+    fn set_zoom(&mut self, zoom: f32, anchor: Vec2, sizes: &[(f32, f32)], now: f64) {
+        let zoom = zoom.clamp(view::MIN_ZOOM, view::MAX_ZOOM);
+        if (zoom - self.zoom).abs() < 0.01 {
+            return;
+        }
+        let (old_px, new_px) = (view::points_to_px(self.zoom), view::points_to_px(zoom));
+        let old = view::layout_pages(sizes, old_px, GAP);
+        let new = view::layout_pages(sizes, new_px, GAP);
+        let offset = self.scroll_to.unwrap_or(self.offset);
+
+        let y = view::map_y(&old, &new, offset.y + anchor.y - MARGIN) + MARGIN - anchor.y;
+        // Pages are centred, so measure x from the content's middle.
+        let view_width = self.view_rect.width();
+        let (old_mid, new_mid) = (
+            content_width(&old, view_width) / 2.0,
+            content_width(&new, view_width) / 2.0,
+        );
+        let x = new_mid + (offset.x + anchor.x - old_mid) / old_px * new_px - anchor.x;
+
+        self.scroll_to = Some(vec2(x, y).max(Vec2::ZERO));
+        self.zoom = zoom;
+        self.zoom_text = zoom_label(zoom);
+        self.zoom_changed_at = now;
+    }
+
+    /// Ctrl+wheel (or a touchpad pinch) over the pages, and Ctrl+plus/minus.
+    fn zoom_input(&mut self, ctx: &egui::Context, sizes: &[(f32, f32)], now: f64) {
+        let (delta, pointer) = ctx.input(|i| (i.zoom_delta(), i.pointer.hover_pos()));
+        let over_view = pointer.filter(|&p| self.view_rect.contains(p));
+        let anchor = over_view.map_or(self.view_rect.size() / 2.0, |p| p - self.view_rect.min);
+        if delta != 1.0 && over_view.is_some() {
+            self.fit_width = false;
+            self.set_zoom(self.zoom * delta, anchor, sizes, now);
+        }
+
+        if ctx.egui_wants_keyboard_input() {
+            return; // Typing in the zoom box.
+        }
+        // Count every press this frame (key repeat can deliver several at once).
+        let (steps_in, steps_out) = ctx.input_mut(|i| {
+            // Ctrl+= also zooms in, so Shift isn't needed on US keyboards.
+            let steps_in = i.count_and_consume_key(Modifiers::COMMAND, Key::Plus)
+                + i.count_and_consume_key(Modifiers::COMMAND, Key::Equals);
+            (
+                steps_in,
+                i.count_and_consume_key(Modifiers::COMMAND, Key::Minus),
+            )
+        });
+        if steps_in + steps_out > 0 {
+            let mut zoom = self.zoom;
+            for _ in 0..steps_in {
+                zoom = view::zoom_in_step(zoom);
+            }
+            for _ in 0..steps_out {
+                zoom = view::zoom_out_step(zoom);
+            }
+            self.fit_width = false;
+            self.set_zoom(zoom, anchor, sizes, now);
+        }
+    }
+
+    /// PgUp/PgDn, Home/End and the arrow keys.
+    fn scroll_keys(&mut self, ctx: &egui::Context, content_height: f32) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let page_step = (self.view_rect.height() - ARROW_STEP).max(ARROW_STEP);
+        let mut offset = self.scroll_to.unwrap_or(self.offset);
+        let moved = ctx.input_mut(|i| {
+            let mut moved = false;
+            let steps = [
+                (Key::PageDown, vec2(0.0, page_step)),
+                (Key::PageUp, vec2(0.0, -page_step)),
+                (Key::ArrowDown, vec2(0.0, ARROW_STEP)),
+                (Key::ArrowUp, vec2(0.0, -ARROW_STEP)),
+                (Key::ArrowRight, vec2(ARROW_STEP, 0.0)),
+                (Key::ArrowLeft, vec2(-ARROW_STEP, 0.0)),
+            ];
+            for (key, step) in steps {
+                // Count every press this frame (key repeat can deliver several at once).
+                let presses = i.count_and_consume_key(Modifiers::NONE, key);
+                if presses > 0 {
+                    offset += step * presses as f32;
+                    moved = true;
+                }
+            }
+            if i.consume_key(Modifiers::NONE, Key::Home) {
+                offset.y = 0.0;
+                moved = true;
+            }
+            if i.consume_key(Modifiers::NONE, Key::End) {
+                offset.y = content_height;
+                moved = true;
+            }
+            moved
+        });
+        if moved {
+            self.scroll_to = Some(offset); // Clamped to the content in `show`.
+        }
+    }
+
+    /// Paints the pages that intersect `viewport` (in content coordinates).
+    fn paint_pages(
+        &mut self,
+        ui: &egui::Ui,
+        origin: Pos2,
+        layout: &PageLayout,
+        viewport: Rect,
+        content_width: f32,
+    ) {
+        let ppp = ui.ctx().pixels_per_point();
+        let target_scale = view::points_to_px(self.zoom) * ppp;
+        let painter = ui.painter();
+        for page in view::visible_range(layout, viewport.min.y - MARGIN, viewport.height()) {
+            let (Some(&(width, height)), Some(&top)) =
+                (layout.sizes.get(page), layout.tops.get(page))
+            else {
+                continue;
+            };
+            let min = origin + vec2((content_width - width) / 2.0, MARGIN + top);
+            let rect = Rect::from_min_size(
+                snap(min, ppp),
+                snap(vec2(width, height).to_pos2(), ppp).to_vec2(),
+            );
+            painter.rect_filled(
+                rect.translate(vec2(2.0, 2.0)),
+                0.0,
+                Color32::from_black_alpha(70),
+            );
+
+            // Stretch the closest cached image while a sharper one is on its way.
+            if let Some(texture) = self.textures.best(page, target_scale, self.frame) {
+                let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+                painter.image(texture.id(), rect, uv, Color32::WHITE);
+            } else if self.failed.iter().any(|&(p, _)| p == page) {
+                painter.rect_filled(rect, 0.0, Color32::from_gray(200));
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Couldn't render this page",
+                    FontId::proportional(16.0),
+                    Color32::from_gray(60),
+                );
+            } else {
+                painter.rect_filled(rect, 0.0, Color32::WHITE);
+            }
+        }
+    }
+
+    /// Asks the pool for the pages in view, then one after and one before.
+    fn request_pages(
+        &mut self,
+        ctx: &egui::Context,
+        sizes: &[(f32, f32)],
+        layout: &PageLayout,
+        pool: &RenderPool,
+        now: f64,
+    ) {
+        let settling = now - self.zoom_changed_at;
+        let settled = settling >= ZOOM_SETTLE_SECS;
+        if !settled {
+            ctx.request_repaint_after(Duration::from_secs_f64(ZOOM_SETTLE_SECS - settling));
+        }
+        let wanted_scale = view::points_to_px(self.zoom) * ctx.pixels_per_point();
+        let max_side = ctx.input(|i| i.max_texture_side);
+
+        let visible = view::visible_range(layout, self.offset.y - MARGIN, self.view_rect.height());
+        let next = (visible.end < sizes.len()).then_some(visible.end);
+        let previous = visible.start.checked_sub(1);
+        let mut wanted = Vec::new();
+        for page in visible.chain(next).chain(previous) {
+            let Some(&size) = sizes.get(page) else {
+                continue;
+            };
+            let scale = view::render_scale(size, wanted_scale, max_side);
+            let key = texture_key(page, scale);
+            let done = self.textures.contains(key) || self.failed.contains(&key);
+            // While zooming, pages that already show something wait for the zoom to settle.
+            let wait = !settled && self.textures.has_any(page);
+            if !done && !wait {
+                wanted.push(RenderRequest {
+                    page,
+                    scale,
+                    thumbnail: false,
+                });
+            }
+        }
+        if wanted != self.requested {
+            pool.set_wanted(wanted.clone());
+            self.requested = wanted;
+        }
+    }
+}
+
+/// "125%" for a zoom of 125.
+fn zoom_label(zoom: f32) -> String {
+    format!("{zoom:.0}%")
+}
+
+/// Content is as wide as the widest page plus margins, or the view if wider.
+fn content_width(layout: &PageLayout, view_width: f32) -> f32 {
+    let widest = layout.sizes.iter().map(|s| s.0).fold(0.0, f32::max);
+    view_width.max(widest + 2.0 * MARGIN)
+}
+
+/// Rounds to whole physical pixels so page images stay sharp.
+fn snap(p: Pos2, pixels_per_point: f32) -> Pos2 {
+    let round = |v: f32| (v * pixels_per_point).round() / pixels_per_point;
+    pos2(round(p.x), round(p.y))
+}
