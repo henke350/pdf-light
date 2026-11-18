@@ -256,7 +256,11 @@ impl App {
             return false;
         };
         let name = file_name(target);
-        if let Err(error) = edit::save_with_pages(&open.document.bytes, open.pages.kept(), target) {
+        // hayro's page count goes along, so lopdf's reading of the file can be checked.
+        let page_count = open.document.page_sizes.len();
+        let saved =
+            edit::save_with_pages(&open.document.bytes, open.pages.kept(), page_count, target);
+        if let Err(error) = saved {
             self.error = Some(ErrorMessage::new(format!("Couldn't save {name}"), &error));
             self.open = Some(open);
             return false;
@@ -564,8 +568,8 @@ impl App {
                 Outcome::Closed => {}
                 Outcome::Done(message) => self.show_status(ctx, message),
                 Outcome::Cancelled => self.show_status(ctx, "Export cancelled".to_owned()),
-                Outcome::Failed(error) => {
-                    self.error = Some(ErrorMessage::new("Couldn't export the pages", &error));
+                Outcome::Failed(reason) => {
+                    self.error = Some(ErrorMessage::new("Couldn't export the pages", &reason));
                 }
             },
         }

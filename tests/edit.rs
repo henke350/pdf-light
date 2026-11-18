@@ -44,7 +44,7 @@ fn files_in(dir: &std::path::Path) -> Vec<String> {
 fn save_with_pages_should_keep_only_listed_pages() {
     let dir = TempDir::new("keep");
     let target = dir.0.join("out.pdf");
-    save_with_pages(&five_pages(), &[0, 2, 4], &target).expect("save works");
+    save_with_pages(&five_pages(), &[0, 2, 4], 5, &target).expect("save works");
 
     let pdf = open_pdf(&Arc::new(std::fs::read(&target).expect("read back"))).expect("opens");
     assert_eq!(pdf.pages().len(), 3);
@@ -61,7 +61,7 @@ fn save_with_pages_should_replace_existing_file() {
     let dir = TempDir::new("replace");
     let target = dir.0.join("out.pdf");
     std::fs::write(&target, b"old contents").expect("write old file");
-    save_with_pages(&five_pages(), &[1, 3], &target).expect("save works");
+    save_with_pages(&five_pages(), &[1, 3], 5, &target).expect("save works");
 
     let pdf = open_pdf(&Arc::new(std::fs::read(&target).expect("read back"))).expect("opens");
     assert_eq!(pdf.pages().len(), 2);
@@ -71,7 +71,7 @@ fn save_with_pages_should_replace_existing_file() {
 fn save_with_pages_should_fail_cleanly_for_unparseable_input() {
     let dir = TempDir::new("garbage");
     let target = dir.0.join("out.pdf");
-    let result = save_with_pages(b"garbage", &[0], &target);
+    let result = save_with_pages(b"garbage", &[0], 1, &target);
     assert!(matches!(result, Err(PdfError::Save(_))));
     assert!(files_in(&dir.0).is_empty());
 }
@@ -80,6 +80,17 @@ fn save_with_pages_should_fail_cleanly_for_unparseable_input() {
 fn save_with_pages_should_fail_cleanly_for_missing_folder() {
     let dir = TempDir::new("missing");
     let target = dir.0.join("no-such-folder").join("out.pdf");
-    assert!(save_with_pages(&five_pages(), &[0], &target).is_err());
+    let result = save_with_pages(&five_pages(), &[0], 5, &target);
+    assert!(matches!(result, Err(PdfError::Io(_))));
+    assert!(files_in(&dir.0).is_empty());
+}
+
+#[test]
+fn save_with_pages_should_refuse_when_page_counts_disagree() {
+    let dir = TempDir::new("count");
+    let target = dir.0.join("out.pdf");
+    // The viewer thinks there are 4 pages, but lopdf finds 5: don't guess which went.
+    let result = save_with_pages(&five_pages(), &[0, 1], 4, &target);
+    assert!(matches!(result, Err(PdfError::Save(_))));
     assert!(files_in(&dir.0).is_empty());
 }

@@ -8,6 +8,7 @@ use pdf_light::error::PdfError;
 use pdf_light::export::{ExportOptions, ImageFormat, existing_outputs, export_pages};
 use std::fs::{self, File};
 use std::io::BufReader;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tiff::decoder::Decoder;
@@ -98,6 +99,31 @@ fn export_should_remove_partial_files_when_cancelled() {
         done < 1
     });
     assert!(matches!(result, Err(PdfError::Cancelled)));
+    assert_eq!(file_count(&dir), 0);
+}
+
+/// Runs an export whose progress callback panics after the first page, the way a
+/// bug in the PDF library would unwind through `export_pages`.
+fn export_that_panics(options: &ExportOptions) {
+    let pdf = open_pdf(&Arc::new(make_pdf(&["a", "b", "c"]))).expect("opens");
+    let pages = [(0, 0), (1, 1), (2, 2)];
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        export_pages(&pdf, &pages, 3, options, &|_, _| panic!("test panic"))
+    }));
+    assert!(result.is_err(), "the panic reaches the caller");
+}
+
+#[test]
+fn export_should_remove_partial_files_when_a_page_panics() {
+    let dir = TempDir::new("panic-png");
+    export_that_panics(&opts(&dir, ImageFormat::Png, 72, false));
+    assert_eq!(file_count(&dir), 0);
+}
+
+#[test]
+fn export_should_remove_a_partial_multipage_tiff_when_a_page_panics() {
+    let dir = TempDir::new("panic-tiff");
+    export_that_panics(&opts(&dir, ImageFormat::Tiff, 72, true));
     assert_eq!(file_count(&dir), 0);
 }
 

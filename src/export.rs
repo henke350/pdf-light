@@ -5,8 +5,8 @@ use crate::render::{self, pixel_size};
 use hayro::hayro_syntax::Pdf;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::BufWriter;
-use std::path::PathBuf;
+use std::io::{BufWriter, Seek, Write};
+use std::path::{Path, PathBuf};
 use tiff::encoder::{Compression, TiffEncoder, colortype};
 
 /// Above this many pixels per page the UI should warn before exporting.
@@ -94,8 +94,9 @@ pub fn existing_outputs(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// it decides the file-name padding, the same as the dialog's preview uses.
 ///
 /// `progress(done, total)` runs after each page; returning `false` cancels the export,
-/// removes every file this run wrote and gives `Err(Cancelled)`. `&dyn Fn(..) -> bool`
-/// is a borrowed callback: any closure taking two numbers and returning a bool fits.
+/// removes every file this run wrote and gives `Err(Cancelled)`. Any other error, or a
+/// panic, removes them too. `&dyn Fn(..) -> bool` is a borrowed callback: any closure
+/// taking two numbers and returning a bool fits.
 pub fn export_pages(
     pdf: &Pdf,
     pages: &[(usize, usize)],
@@ -116,17 +117,70 @@ pub fn export_pages(
     let positions: Vec<usize> = pages.iter().map(|&(position, _)| position).collect();
     let paths = output_paths(opts, &positions, page_count);
 
-    let mut written = Vec::new();
-    match write_all(pdf, pages, opts, scale, &paths, &mut written, progress) {
-        Ok(()) => Ok(written),
-        Err(error) => {
+    let mut written = WrittenFiles::default();
+    write_all(pdf, pages, opts, scale, &paths, &mut written, progress)?;
+    Ok(written.keep())
+}
+
+/// The files an export has created so far. Unless `keep` is called, dropping it
+/// removes them: after an error, a cancel, or even a panic unwinding through
+/// `export_pages` (`Drop` runs then too), so no half-finished files stay behind.
+#[derive(Default)]
+struct WrittenFiles {
+    paths: Vec<PathBuf>,
+    kept: bool,
+}
+
+impl WrittenFiles {
+    fn push(&mut self, path: &Path) {
+        self.paths.push(path.to_path_buf());
+    }
+
+    /// The export finished: keep the files and hand back their paths.
+    fn keep(mut self) -> Vec<PathBuf> {
+        self.kept = true;
+        // `mem::take` moves the list out and leaves an empty one in its place.
+        std::mem::take(&mut self.paths)
+    }
+}
+
+impl Drop for WrittenFiles {
+    fn drop(&mut self) {
+        if !self.kept {
             // Best effort: a file we can't remove is not worth hiding the real error.
-            for path in &written {
+            for path in &self.paths {
                 let _ = fs::remove_file(path);
             }
-            Err(error)
         }
     }
+}
+
+/// One rendered page as RGB bytes, ready for an image encoder.
+struct RgbPage {
+    width: u32,
+    height: u32,
+    rgb: Vec<u8>,
+}
+
+fn render_rgb(pdf: &Pdf, index: usize, scale: f32) -> Result<RgbPage, PdfError> {
+    let rendered = render::render_page(pdf, index, scale)?;
+    // Drop the alpha channel: pages are opaque white-backed, so RGB loses nothing.
+    let rgb = rendered
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|px| [px[0], px[1], px[2]])
+        .collect();
+    Ok(RgbPage {
+        width: rendered.width,
+        height: rendered.height,
+        rgb,
+    })
+}
+
+fn image_error(error: impl std::fmt::Display) -> PdfError {
+    PdfError::Image(error.to_string())
 }
 
 /// Renders and writes every page, recording each created file in `written`.
@@ -136,70 +190,137 @@ fn write_all(
     opts: &ExportOptions,
     scale: f32,
     paths: &[PathBuf],
-    written: &mut Vec<PathBuf>,
+    written: &mut WrittenFiles,
     progress: &dyn Fn(usize, usize) -> bool,
 ) -> Result<(), PdfError> {
     let total = pages.len();
-    let multipage = opts.format == ImageFormat::Tiff && opts.multipage_tiff;
+    // Called after each page; the owner may have pressed Cancel meanwhile.
+    let report = |done: usize| {
+        if progress(done, total) {
+            Ok(())
+        } else {
+            Err(PdfError::Cancelled)
+        }
+    };
 
-    // The encoder lives in an `Option` so single-file formats can leave it empty.
-    let mut encoder = None;
-    if multipage && let Some(path) = paths.first() {
+    if opts.format == ImageFormat::Tiff && opts.multipage_tiff {
+        let path = paths.first().ok_or(PdfError::Invalid)?;
         let file = File::create(path)?;
-        written.push(path.clone());
-        let new = TiffEncoder::new(BufWriter::new(file))
-            .map_err(|e| PdfError::Image(e.to_string()))?
-            .with_compression(Compression::Lzw);
-        encoder = Some(new);
+        written.push(path);
+        return write_tiff(file, |encoder| {
+            for (done, &(_, index)) in pages.iter().enumerate() {
+                write_tiff_page(encoder, &render_rgb(pdf, index, scale)?)?;
+                report(done + 1)?;
+            }
+            Ok(())
+        });
     }
 
     for (done, &(_, index)) in pages.iter().enumerate() {
-        let rendered = render::render_page(pdf, index, scale)?;
-        // Drop the alpha channel: pages are opaque white-backed, so RGB loses nothing.
-        let rgb: Vec<u8> = rendered
-            .rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .flat_map(|px| [px[0], px[1], px[2]])
-            .collect();
-
-        if let Some(encoder) = encoder.as_mut() {
-            encoder
-                .write_image::<colortype::RGB8>(rendered.width, rendered.height, &rgb)
-                .map_err(|e| PdfError::Image(e.to_string()))?;
-        } else {
-            let path = paths.get(done).ok_or(PdfError::Invalid)?;
-            written.push(path.clone());
-            match opts.format {
-                ImageFormat::Png => {
-                    let image = image::RgbImage::from_raw(rendered.width, rendered.height, rgb)
-                        .ok_or_else(|| PdfError::Image("bad pixel buffer".to_string()))?;
-                    image
-                        .save(path)
-                        .map_err(|e| PdfError::Image(e.to_string()))?;
-                }
-                ImageFormat::Tiff => {
-                    let file = BufWriter::new(File::create(path)?);
-                    TiffEncoder::new(file)
-                        .map_err(|e| PdfError::Image(e.to_string()))?
-                        .with_compression(Compression::Lzw)
-                        .write_image::<colortype::RGB8>(rendered.width, rendered.height, &rgb)
-                        .map_err(|e| PdfError::Image(e.to_string()))?;
-                }
+        let page = render_rgb(pdf, index, scale)?;
+        let path = paths.get(done).ok_or(PdfError::Invalid)?;
+        written.push(path);
+        match opts.format {
+            ImageFormat::Png => {
+                let image = image::RgbImage::from_raw(page.width, page.height, page.rgb)
+                    .ok_or_else(|| PdfError::Image("bad pixel buffer".to_string()))?;
+                image.save(path).map_err(image_error)?;
+            }
+            ImageFormat::Tiff => {
+                write_tiff(File::create(path)?, |encoder| {
+                    write_tiff_page(encoder, &page)
+                })?;
             }
         }
-
-        if !progress(done + 1, total) {
-            return Err(PdfError::Cancelled);
-        }
+        report(done + 1)?;
     }
     Ok(())
+}
+
+/// Writes a TIFF to `writer`: `write_pages` adds the pages through the encoder,
+/// then the last buffered bytes are flushed.
+///
+/// `W: Write + Seek` means any writer that can also jump around (a `File`, or
+/// an in-memory `Cursor` in the tests); the tiff encoder needs both.
+fn write_tiff<W: Write + Seek>(
+    writer: W,
+    write_pages: impl FnOnce(&mut TiffEncoder<&mut BufWriter<W>>) -> Result<(), PdfError>,
+) -> Result<(), PdfError> {
+    let mut buffered = BufWriter::new(writer);
+    let mut encoder = TiffEncoder::new(&mut buffered)
+        .map_err(image_error)?
+        .with_compression(Compression::Lzw);
+    write_pages(&mut encoder)?;
+    // `encoder` borrowed `buffered`, but it isn't used any more, so the borrow is
+    // over and `buffered` is ours again. The tiff encoder never flushes, and a
+    // `BufWriter` that is just dropped ignores write errors, so without this a
+    // full disk would leave a cut-off file that looks like a success.
+    buffered.flush()?;
+    Ok(())
+}
+
+fn write_tiff_page<W: Write + Seek>(
+    encoder: &mut TiffEncoder<W>,
+    page: &RgbPage,
+) -> Result<(), PdfError> {
+    encoder
+        .write_image::<colortype::RGB8>(page.width, page.height, &page.rgb)
+        .map_err(image_error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Cursor, SeekFrom};
+
+    /// A writer with room for only `room` bytes, like a nearly full disk.
+    struct NearlyFullDisk {
+        inner: Cursor<Vec<u8>>,
+        room: u64,
+    }
+
+    impl Write for NearlyFullDisk {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.inner.position() + buf.len() as u64 > self.room {
+                return Err(io::Error::other("disk full"));
+            }
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for NearlyFullDisk {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    fn white_page() -> RgbPage {
+        RgbPage {
+            width: 8,
+            height: 8,
+            rgb: vec![255; 8 * 8 * 3],
+        }
+    }
+
+    /// Writes one white page as a TIFF onto a disk with `room` bytes.
+    fn tiff_on_disk(room: u64) -> Result<u64, PdfError> {
+        let mut disk = NearlyFullDisk {
+            inner: Cursor::new(Vec::new()),
+            room,
+        };
+        write_tiff(&mut disk, |encoder| write_tiff_page(encoder, &white_page()))?;
+        Ok(disk.inner.get_ref().len() as u64)
+    }
+
+    #[test]
+    fn write_tiff_should_report_a_disk_that_fills_up_at_the_end() {
+        let size = tiff_on_disk(u64::MAX).expect("fits on a big disk");
+        assert!(tiff_on_disk(size - 1).is_err());
+    }
 
     fn opts(format: ImageFormat, multipage_tiff: bool) -> ExportOptions {
         ExportOptions {

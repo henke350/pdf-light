@@ -14,6 +14,7 @@ use pdf_light::export::{
     parse_page_range,
 };
 use pdf_light::render::{MAX_PIXELS, MAX_SIDE_PX, pixel_size};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
@@ -270,7 +271,8 @@ pub enum Outcome {
     /// Finished; the text is the status-bar message.
     Done(String),
     Cancelled,
-    Failed(PdfError),
+    /// It went wrong; the text says why ("a page couldn't be rendered").
+    Failed(String),
 }
 
 /// A running export on its own thread.
@@ -413,12 +415,12 @@ impl ExportDialog {
         match job.result.try_recv() {
             Ok(Ok(_files)) => Some(Outcome::Done(exported_message(job.total, &job.folder))),
             Ok(Err(PdfError::Cancelled)) => Some(Outcome::Cancelled),
-            Ok(Err(error)) => Some(Outcome::Failed(error)),
+            Ok(Err(error)) => Some(Outcome::Failed(error.to_string())),
             Err(mpsc::TryRecvError::Empty) => None,
-            // The thread ended without sending: it must have panicked.
-            Err(mpsc::TryRecvError::Disconnected) => Some(Outcome::Failed(PdfError::Image(
-                "the export stopped unexpectedly".to_owned(),
-            ))),
+            // The thread ended without sending: the PDF library panicked.
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Outcome::Failed("a page couldn't be rendered".to_owned()))
+            }
         }
     }
 
@@ -476,10 +478,19 @@ impl ExportDialog {
                 thread_ctx.request_repaint();
                 !thread_cancel.load(Ordering::Relaxed)
             };
-            let outcome = document::open_pdf(&bytes)
-                .and_then(|pdf| export_pages(&pdf, &pages, page_count, &options, &progress));
+            // As in the render pool, a panic inside the PDF library must not
+            // escape: `catch_unwind` stops it here. `export_pages` has removed
+            // the files it wrote by then.
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                document::open_pdf(&bytes)
+                    .and_then(|pdf| export_pages(&pdf, &pages, page_count, &options, &progress))
+            }));
             // The dialog may be gone already; then nobody needs the result.
-            let _ = sender.send(outcome);
+            if let Ok(outcome) = outcome {
+                let _ = sender.send(outcome);
+            }
+            // After a panic nothing was sent: closing the channel tells the dialog.
+            drop(sender);
             thread_ctx.request_repaint();
         });
         self.phase = Phase::Running(Job {
@@ -889,6 +900,25 @@ mod tests {
             result,
         };
         (job, sender)
+    }
+
+    #[test]
+    fn poll_job_should_blame_rendering_when_the_thread_stops_without_a_result() {
+        let (job, sender) = job();
+        // What the export thread does after catching a panic.
+        drop(sender);
+        let mut dialog = ExportDialog::new(
+            Path::new("a.pdf"),
+            Arc::new(Vec::new()),
+            vec![0],
+            vec![(612.0, 792.0)],
+            vec![],
+        );
+        dialog.phase = Phase::Running(job);
+        assert!(matches!(
+            dialog.poll_job(),
+            Some(Outcome::Failed(reason)) if reason == "a page couldn't be rendered"
+        ));
     }
 
     #[test]
