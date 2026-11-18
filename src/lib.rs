@@ -7,5 +7,7 @@ pub mod error;
 pub mod export;
 pub mod pages;
 pub mod render;
+pub mod render_pool;
 pub mod search;
 pub mod text;
+pub mod view;
