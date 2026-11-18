@@ -345,7 +345,7 @@ impl App {
         let page_count = open.pages.len();
         let chosen = match self.owner {
             Some(owner) => {
-                print::choose_printer(owner, page_count, !selected.is_empty(), &open.name())
+                print::choose_printer(owner, page_count, !selected.is_empty(), &open.document.path)
             }
             None => Err("the window isn't ready for printing".to_owned()),
         };

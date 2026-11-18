@@ -16,7 +16,11 @@ use pdf_light::document;
 use pdf_light::export::parse_page_range;
 use pdf_light::print_layout::{self, Dib, Placement, bands, bgr_dib};
 use pdf_light::render;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle,
+    Win32WindowHandle, WindowHandle,
+};
+use std::num::NonZeroIsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
@@ -44,21 +48,39 @@ const BAND_BYTES: usize = 8 * 1024 * 1024;
 /// Longest the window waits on close for a cancelled print to stop.
 const CLOSE_WAIT: Duration = Duration::from_secs(120);
 
-/// The main window, which owns the print dialog.
+/// The main window, which owns the print dialog and the "Save print output
+/// as" box. Only valid while that window exists, which is the app's whole life.
 #[derive(Debug, Clone, Copy)]
-pub struct Owner(isize);
+pub struct Owner(NonZeroIsize);
 
 impl Owner {
     /// The window behind `window` (eframe's creation context or frame), if it is a Win32 window.
     pub fn of(window: &impl HasWindowHandle) -> Option<Self> {
         match window.window_handle().ok()?.as_raw() {
-            RawWindowHandle::Win32(handle) => Some(Self(handle.hwnd.get())),
+            RawWindowHandle::Win32(handle) => Some(Self(handle.hwnd)),
             _ => None,
         }
     }
 
     fn hwnd(self) -> HWND {
-        HWND(self.0 as *mut std::ffi::c_void)
+        HWND(self.0.get() as *mut std::ffi::c_void)
+    }
+}
+
+// rfd's save dialog takes its parent window through these two traits.
+impl HasWindowHandle for Owner {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let raw = RawWindowHandle::Win32(Win32WindowHandle::new(self.0));
+        // SAFETY: `self.0` is the main window's HWND, read from eframe at
+        // start-up. That window lives as long as the app, so it outlives this
+        // borrow; it is only used on the UI thread, which owns the window.
+        Ok(unsafe { WindowHandle::borrow_raw(raw) })
+    }
+}
+
+impl HasDisplayHandle for Owner {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        Ok(DisplayHandle::windows())
     }
 }
 
@@ -214,8 +236,8 @@ impl Drop for GlobalMemory {
 }
 
 impl GlobalMemory {
-    /// The printer name in a DEVNAMES block.
-    fn device_name(&self) -> Option<String> {
+    /// The printer name and port in a DEVNAMES block.
+    fn dev_names(&self) -> Option<DevNames> {
         if self.0.is_invalid() {
             return None;
         }
@@ -228,18 +250,38 @@ impl GlobalMemory {
             if start.is_null() {
                 return None;
             }
-            let name = device_name(std::slice::from_raw_parts(start, size));
+            let names = dev_names(std::slice::from_raw_parts(start, size));
             let _ = GlobalUnlock(self.0);
-            name
+            names
         }
     }
 }
 
-/// Reads the device (printer) name out of a DEVNAMES block: four 16-bit
-/// offsets, then NUL-terminated UTF-16 strings; the second offset, counted in
-/// UTF-16 units from the start, is the printer name.
-fn device_name(devnames: &[u8]) -> Option<String> {
-    let offset = usize::from(u16::from_le_bytes([*devnames.get(2)?, *devnames.get(3)?]));
+/// The printer's name and the port it prints to, e.g. "Microsoft Print to PDF"
+/// on "PORTPROMPT:".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DevNames {
+    device: String,
+    port: String,
+}
+
+/// Reads a DEVNAMES block: four 16-bit offsets (driver, device, output port,
+/// flags), counted in UTF-16 units from the start, each to a NUL-terminated
+/// UTF-16 string.
+fn dev_names(devnames: &[u8]) -> Option<DevNames> {
+    Some(DevNames {
+        device: devnames_string(devnames, 1)?,
+        port: devnames_string(devnames, 2)?,
+    })
+}
+
+/// The string the `field`th offset of a DEVNAMES block points at.
+fn devnames_string(devnames: &[u8], field: usize) -> Option<String> {
+    let at = field * 2;
+    let offset = usize::from(u16::from_le_bytes([
+        *devnames.get(at)?,
+        *devnames.get(at + 1)?,
+    ]));
     let units: Vec<u16> = devnames
         .get(offset * 2..)?
         .as_chunks::<2>()
@@ -256,6 +298,63 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Whether a printer on `port` writes a file and would ask where, from inside
+/// StartDocW: "PORTPROMPT:" (Microsoft Print to PDF, XPS Document Writer) and
+/// "FILE:" (print to file). pdf-light asks first, so the print thread never
+/// waits on a box the owner may not see.
+pub fn needs_output_path(port: &str) -> bool {
+    let port = port.trim();
+    port.eq_ignore_ascii_case("PORTPROMPT:") || port.eq_ignore_ascii_case("FILE:")
+}
+
+/// Where the save box starts: "report-print.pdf" next to "report.pdf" for a
+/// PDF printer ("PORTPROMPT:"), "report-print.prn" for "FILE:".
+fn suggested_output(pdf_path: &Path, port: &str) -> PathBuf {
+    let stem = pdf_path.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = if port.trim().eq_ignore_ascii_case("FILE:") {
+        "prn"
+    } else {
+        "pdf"
+    };
+    pdf_path.with_file_name(format!("{stem}-print.{extension}"))
+}
+
+/// Asks where to save printer output, with the Windows save box owned by the
+/// main window (it blocks, like the Open dialog). `None` when cancelled.
+fn ask_output_path(owner: Owner, suggested: &Path) -> Option<PathBuf> {
+    let extension = suggested
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label = if extension == "pdf" {
+        "PDF"
+    } else {
+        "Printer file"
+    };
+    let mut dialog = rfd::FileDialog::new()
+        .set_parent(&owner)
+        .add_filter(label, &[extension.as_str()]);
+    if let Some(name) = suggested.file_name() {
+        dialog = dialog.set_file_name(name.to_string_lossy());
+    }
+    if let Some(folder) = suggested.parent().filter(|f| f.is_dir()) {
+        dialog = dialog.set_directory(folder);
+    }
+    let mut path = dialog.save_file()?;
+    if path.extension().is_none() {
+        path.set_extension(&extension);
+    }
+    Some(path)
+}
+
+/// What the print dialog's pages and copies boxes said.
+pub struct Settings {
+    pub pages: PageChoice,
+    /// Copies pdf-light sends itself; 1 when the printer driver makes the copies.
+    pub copies: u32,
+    pub collate: bool,
+}
+
 /// What the owner chose in the print dialog, with the printer ready to use.
 pub struct PrintJob {
     dc: PrinterDc,
@@ -266,17 +365,52 @@ pub struct PrintJob {
     pub collate: bool,
     /// The name the print queue shows, e.g. "report.pdf".
     pub document_name: String,
-    /// Print into this file instead of to the printer's port (used by the tests).
+    /// Print into this file instead of to the printer's port. Set for printers
+    /// that write a file, so StartDocW never asks on the print thread.
     output: Option<PathBuf>,
 }
 
-/// Shows the Windows print dialog (blocking, like any modal dialog). Returns
-/// `None` when the owner cancels. "Selection" is offered when `has_selection`.
+impl PrintJob {
+    /// Gets a job ready for `dc`. When the printer's `port` writes a file,
+    /// `ask_output` is asked where (given a suggested path) now, on the UI
+    /// thread; `None` from it cancels the print. Shared by the app and the tests.
+    fn prepare(
+        dc: PrinterDc,
+        printer_name: String,
+        port: &str,
+        settings: Settings,
+        pdf_path: &Path,
+        ask_output: impl FnOnce(&Path) -> Option<PathBuf>,
+    ) -> Option<Self> {
+        let output = if needs_output_path(port) {
+            Some(ask_output(&suggested_output(pdf_path, port))?)
+        } else {
+            None
+        };
+        Some(Self {
+            dc,
+            printer_name,
+            pages: settings.pages,
+            copies: settings.copies,
+            collate: settings.collate,
+            document_name: pdf_path
+                .file_name()
+                .unwrap_or(pdf_path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            output,
+        })
+    }
+}
+
+/// Shows the Windows print dialog (blocking, like any modal dialog), then for
+/// a printer that writes a file (a PDF printer, say) the save box. Returns
+/// `None` when the owner cancels either. "Selection" is offered when `has_selection`.
 pub fn choose_printer(
     owner: Owner,
     page_count: usize,
     has_selection: bool,
-    document_name: &str,
+    pdf_path: &Path,
 ) -> Result<Option<PrintJob>, String> {
     let mut ranges = vec![PRINTPAGERANGE::default(); MAX_RANGES];
     // Let the driver make copies when it can (PD_USEDEVMODECOPIESANDCOLLATE);
@@ -330,15 +464,23 @@ pub fn choose_printer(
     } else {
         PageChoice::All
     };
-    Ok(Some(PrintJob {
-        dc,
-        printer_name: dev_names.device_name().unwrap_or_default(),
+    let names = dev_names.dev_names().unwrap_or(DevNames {
+        device: String::new(),
+        port: String::new(),
+    });
+    let settings = Settings {
         pages,
         copies: dialog.nCopies.max(1),
         collate: dialog.Flags.contains(PD_COLLATE),
-        document_name: document_name.to_owned(),
-        output: None,
-    }))
+    };
+    Ok(PrintJob::prepare(
+        dc,
+        names.device,
+        &names.port,
+        settings,
+        pdf_path,
+        |suggested| ask_output_path(owner, suggested),
+    ))
 }
 
 /// "context: Windows' own message", for the error dialog.
@@ -713,17 +855,90 @@ mod tests {
     }
 
     #[test]
-    fn device_name_should_read_the_printer_name_from_devnames() {
-        // Offsets (in UTF-16 units): driver 4, device 4, output 6, default 0;
-        // then "Pr" NUL "X" NUL.
-        let units: [u16; 9] = [4, 4, 7, 0, 'P' as u16, 'r' as u16, 0, 'X' as u16, 0];
+    fn dev_names_should_read_the_printer_name_and_port() {
+        // Offsets (in UTF-16 units): driver 4, device 4, output 7, flags 0;
+        // then "Pr" NUL "X:" NUL.
+        let units: [u16; 10] = [
+            4, 4, 7, 0, 'P' as u16, 'r' as u16, 0, 'X' as u16, ':' as u16, 0,
+        ];
         let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
-        assert_eq!(device_name(&bytes), Some("Pr".to_owned()));
+        assert_eq!(
+            dev_names(&bytes),
+            Some(DevNames {
+                device: "Pr".to_owned(),
+                port: "X:".to_owned()
+            })
+        );
     }
 
     #[test]
-    fn device_name_should_refuse_a_truncated_block() {
-        assert_eq!(device_name(&[4, 0]), None);
+    fn dev_names_should_refuse_a_truncated_block() {
+        assert_eq!(dev_names(&[4, 0, 4, 0]), None);
+    }
+
+    #[test]
+    fn needs_output_path_should_be_true_for_ports_that_write_a_file() {
+        assert_eq!(
+            [
+                needs_output_path("PORTPROMPT:"),
+                needs_output_path("portprompt:"),
+                needs_output_path(" FILE: "),
+                needs_output_path("nul:"),
+                needs_output_path("BRW749779EA03BA"),
+                needs_output_path("WSD-6515df7b"),
+                needs_output_path(""),
+            ],
+            [true, true, true, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn suggested_output_should_sit_next_to_the_pdf() {
+        let pdf = Path::new(r"C:\docs\report.pdf");
+        assert_eq!(
+            [
+                suggested_output(pdf, "PORTPROMPT:"),
+                suggested_output(pdf, "FILE:")
+            ],
+            [
+                PathBuf::from(r"C:\docs\report-print.pdf"),
+                PathBuf::from(r"C:\docs\report-print.prn")
+            ]
+        );
+    }
+
+    fn all_once() -> Settings {
+        Settings {
+            pages: PageChoice::All,
+            copies: 1,
+            collate: false,
+        }
+    }
+
+    #[test]
+    fn prepare_should_not_ask_for_a_file_for_a_real_printer() {
+        let job = PrintJob::prepare(
+            PrinterDc(HDC::default()),
+            "Office".to_owned(),
+            "BRW749779EA03BA",
+            all_once(),
+            Path::new("report.pdf"),
+            |_| panic!("must not ask"),
+        );
+        assert_eq!(job.map(|j| j.output), Some(None));
+    }
+
+    #[test]
+    fn prepare_should_cancel_when_the_save_box_is_cancelled() {
+        let job = PrintJob::prepare(
+            PrinterDc(HDC::default()),
+            "Microsoft Print to PDF".to_owned(),
+            "PORTPROMPT:",
+            all_once(),
+            Path::new("report.pdf"),
+            |_| None,
+        );
+        assert!(job.is_none());
     }
 
     #[test]
@@ -764,23 +979,13 @@ mod tests {
     #[test]
     #[ignore = "uses the Windows print spooler and the Microsoft Print to PDF printer"]
     fn print_to_pdf_should_place_and_turn_pages() {
-        let printer = "Microsoft Print to PDF";
         let output = OutputFile(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("target")
                 .join(format!("print-test-{}.pdf", std::process::id())),
         );
         let _ = std::fs::remove_file(&output.0);
-        let dc = PrinterDc::open(printer).expect("Microsoft Print to PDF is installed");
-        let job = PrintJob {
-            dc,
-            printer_name: printer.to_owned(),
-            pages: PageChoice::All,
-            copies: 1,
-            collate: false,
-            document_name: "pdf-light print test".to_owned(),
-            output: Some(output.0.clone()),
-        };
+        let job = pdf_printer_job(&output.0);
         let sizes = [(400.0, 500.0), (500.0, 400.0), (612.0, 792.0)];
         let bytes = Arc::new(test_pdf(&sizes));
         let positions = chosen_positions(&job.pages, sizes.len(), &[]).expect("all pages");
@@ -848,21 +1053,12 @@ mod tests {
     #[test]
     #[ignore = "uses the Windows print spooler and the Microsoft Print to PDF printer"]
     fn print_to_pdf_should_abort_the_job_when_cancelled() {
-        let printer = "Microsoft Print to PDF";
         let output = OutputFile(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("target")
                 .join(format!("print-cancel-test-{}.pdf", std::process::id())),
         );
-        let job = PrintJob {
-            dc: PrinterDc::open(printer).expect("Microsoft Print to PDF is installed"),
-            printer_name: printer.to_owned(),
-            pages: PageChoice::All,
-            copies: 1,
-            collate: false,
-            document_name: "pdf-light cancel test".to_owned(),
-            output: Some(output.0.clone()),
-        };
+        let job = pdf_printer_job(&output.0);
         let bytes = Arc::new(test_pdf(&[(400.0, 500.0); 3]));
         let progress = |done: usize, _: usize| done < 1;
         let outcome = print(&bytes, &[0, 1, 2], &[0, 1, 2], job, &progress);
@@ -870,6 +1066,31 @@ mod tests {
         std::thread::sleep(Duration::from_secs(3));
         let printed = document::open(&output.0).map(|d| d.page_sizes.len());
         assert!(printed.is_err(), "no PDF should come out, got {printed:?}");
+    }
+
+    /// A job for "Microsoft Print to PDF", made the way the app makes one after
+    /// the dialog: its port ("PORTPROMPT:", as `Get-Printer` lists it) needs a
+    /// file, so `prepare` asks for one, and the stand-in for the save box answers
+    /// `output`. StartDocW then writes there without a box of its own.
+    fn pdf_printer_job(output: &Path) -> PrintJob {
+        let printer = "Microsoft Print to PDF";
+        let dc = PrinterDc::open(printer).expect("Microsoft Print to PDF is installed");
+        let mut asked = None;
+        let job = PrintJob::prepare(
+            dc,
+            printer.to_owned(),
+            "PORTPROMPT:",
+            all_once(),
+            Path::new(r"C:\docs\sample.pdf"),
+            |suggested| {
+                asked = Some(suggested.to_path_buf());
+                Some(output.to_path_buf())
+            },
+        )
+        .expect("the save box answered");
+        assert_eq!(asked, Some(PathBuf::from(r"C:\docs\sample-print.pdf")));
+        assert_eq!(job.output.as_deref(), Some(output));
+        job
     }
 
     /// Deletes the printed file when the test ends, pass or fail.
