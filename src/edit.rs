@@ -1,6 +1,8 @@
-//! Writing a copy of the PDF with some pages removed.
+//! Writing a copy of the PDF with some pages removed and some turned.
 
 use crate::error::PdfError;
+use crate::pages::KeptPage;
+use lopdf::{Dictionary, Object, ObjectId};
 use std::path::{Path, PathBuf};
 
 /// Removes a leftover temp file when dropped, unless `disarm` was called.
@@ -25,14 +27,15 @@ impl Drop for TempGuard {
     }
 }
 
-/// Saves `original` to `target`, keeping only the pages in `kept` (0-based indices).
+/// Saves `original` to `target`, keeping only the pages in `kept` and turning
+/// each by its `rotation` (added to the page's own `/Rotate`).
 /// `page_count` is how many pages the viewer (hayro) found in `original`.
 ///
 /// Writes a temp file next to `target`, flushes it to disk and renames it into
 /// place, so the target is never left half-written.
 pub fn save_with_pages(
     original: &[u8],
-    kept: &[usize],
+    kept: &[KeptPage],
     page_count: usize,
     target: &Path,
 ) -> Result<(), PdfError> {
@@ -47,11 +50,21 @@ pub fn save_with_pages(
         ));
     }
     // lopdf numbers pages from 1, in page order.
-    let to_delete: Vec<u32> = doc
-        .get_pages()
+    let pages = doc.get_pages();
+    for page in kept.iter().filter(|page| page.rotation.degrees() != 0) {
+        let id = u32::try_from(page.index + 1)
+            .ok()
+            .and_then(|number| pages.get(&number))
+            .ok_or_else(|| PdfError::Save("a page to turn wasn't found in the file".into()))?;
+        let degrees = (page_rotation(&doc, *id) + page.rotation.degrees()) % 360;
+        doc.get_dictionary_mut(*id)
+            .map_err(save_err)?
+            .set("Rotate", Object::Integer(degrees));
+    }
+    let to_delete: Vec<u32> = pages
         .keys()
         .copied()
-        .filter(|number| !kept.contains(&(*number as usize - 1)))
+        .filter(|number| !kept.iter().any(|page| page.index == *number as usize - 1))
         .collect();
     doc.delete_pages(&to_delete);
     doc.prune_objects();
@@ -76,4 +89,34 @@ pub fn save_with_pages(
     std::fs::rename(&temp_path, target)?;
     guard.disarm();
     Ok(())
+}
+
+/// How far the page `id` is turned in the file: its `/Rotate`, or the nearest
+/// parent's (pages inherit it), as 0, 90, 180 or 270. A value that isn't a
+/// multiple of 90 counts as 0, the same as the viewer (hayro) reads it.
+fn page_rotation(doc: &lopdf::Document, id: ObjectId) -> i64 {
+    // How deep to follow `/Parent`: a guard against a loop in a broken file.
+    const MAX_DEPTH: usize = 64;
+    let mut dict: Option<&Dictionary> = doc.get_dictionary(id).ok();
+    for _ in 0..MAX_DEPTH {
+        let Some(current) = dict else {
+            break;
+        };
+        if let Ok(rotate) = current.get(b"Rotate") {
+            // Some writers store it as a real number such as 90.0.
+            let degrees = rotate
+                .as_i64()
+                .ok()
+                .or_else(|| rotate.as_float().ok().map(|f| f.round() as i64))
+                .unwrap_or(0)
+                .rem_euclid(360);
+            return if degrees % 90 == 0 { degrees } else { 0 };
+        }
+        dict = current
+            .get(b"Parent")
+            .and_then(Object::as_reference)
+            .and_then(|parent| doc.get_dictionary(parent))
+            .ok();
+    }
+    0
 }

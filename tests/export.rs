@@ -6,6 +6,8 @@ use common::make_pdf;
 use pdf_light::document::open_pdf;
 use pdf_light::error::PdfError;
 use pdf_light::export::{ExportOptions, ImageFormat, existing_outputs, export_pages};
+use pdf_light::pages::KeptPage;
+use pdf_light::rotation::Rotation;
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -50,8 +52,14 @@ fn export_png_should_match_dpi() {
     let dir = TempDir::new("png");
     let pdf = open_pdf(&Arc::new(make_pdf(&["a"]))).expect("opens");
     let options = opts(&dir, ImageFormat::Png, 144, false);
-    let paths =
-        export_pages(&pdf, &[(0, 0)], pdf.pages().len(), &options, &|_, _| true).expect("exports");
+    let paths = export_pages(
+        &pdf,
+        &[(0, KeptPage::upright(0))],
+        pdf.pages().len(),
+        &options,
+        &|_, _| true,
+    )
+    .expect("exports");
     assert_eq!(paths.len(), 1);
     let image = image::open(&paths[0]).expect("png decodes");
     assert_eq!((image.width(), image.height()), (1224, 1584));
@@ -62,8 +70,14 @@ fn export_tiff_should_match_dpi() {
     let dir = TempDir::new("tiff");
     let pdf = open_pdf(&Arc::new(make_pdf(&["a"]))).expect("opens");
     let options = opts(&dir, ImageFormat::Tiff, 144, false);
-    let paths =
-        export_pages(&pdf, &[(0, 0)], pdf.pages().len(), &options, &|_, _| true).expect("exports");
+    let paths = export_pages(
+        &pdf,
+        &[(0, KeptPage::upright(0))],
+        pdf.pages().len(),
+        &options,
+        &|_, _| true,
+    )
+    .expect("exports");
     let file = BufReader::new(File::open(&paths[0]).expect("opens"));
     let mut decoder = Decoder::new(file).expect("tiff decodes");
     assert_eq!(decoder.dimensions().expect("size"), (1224, 1584));
@@ -73,7 +87,11 @@ fn export_tiff_should_match_dpi() {
 fn export_multipage_tiff_should_hold_every_page() {
     let dir = TempDir::new("multitiff");
     let pdf = open_pdf(&Arc::new(make_pdf(&["a", "b", "c"]))).expect("opens");
-    let pages = [(0, 0), (1, 1), (2, 2)];
+    let pages = [
+        (0, KeptPage::upright(0)),
+        (1, KeptPage::upright(1)),
+        (2, KeptPage::upright(2)),
+    ];
     let options = opts(&dir, ImageFormat::Tiff, 72, true);
     let paths =
         export_pages(&pdf, &pages, pdf.pages().len(), &options, &|_, _| true).expect("exports");
@@ -92,7 +110,11 @@ fn export_multipage_tiff_should_hold_every_page() {
 fn export_should_remove_partial_files_when_cancelled() {
     let dir = TempDir::new("cancel");
     let pdf = open_pdf(&Arc::new(make_pdf(&["a", "b", "c"]))).expect("opens");
-    let pages = [(0, 0), (1, 1), (2, 2)];
+    let pages = [
+        (0, KeptPage::upright(0)),
+        (1, KeptPage::upright(1)),
+        (2, KeptPage::upright(2)),
+    ];
     let options = opts(&dir, ImageFormat::Png, 72, false);
     // Returns `false` once the first page is done.
     let result = export_pages(&pdf, &pages, pdf.pages().len(), &options, &|done, _| {
@@ -106,7 +128,11 @@ fn export_should_remove_partial_files_when_cancelled() {
 /// bug in the PDF library would unwind through `export_pages`.
 fn export_that_panics(options: &ExportOptions) {
     let pdf = open_pdf(&Arc::new(make_pdf(&["a", "b", "c"]))).expect("opens");
-    let pages = [(0, 0), (1, 1), (2, 2)];
+    let pages = [
+        (0, KeptPage::upright(0)),
+        (1, KeptPage::upright(1)),
+        (2, KeptPage::upright(2)),
+    ];
     let result = catch_unwind(AssertUnwindSafe(|| {
         export_pages(&pdf, &pages, 3, options, &|_, _| panic!("test panic"))
     }));
@@ -134,7 +160,7 @@ fn export_should_refuse_oversized_pages() {
     let options = opts(&dir, ImageFormat::Png, 7000, false);
     let result = export_pages(
         &pdf,
-        &[(0, 0), (1, 1)],
+        &[(0, KeptPage::upright(0)), (1, KeptPage::upright(1))],
         pdf.pages().len(),
         &options,
         &|_, _| true,
@@ -160,14 +186,41 @@ fn export_should_number_files_from_the_given_page_count() {
     let pdf = open_pdf(&Arc::new(make_pdf(&["a"]))).expect("opens");
     let options = opts(&dir, ImageFormat::Png, 72, false);
     let expected = pdf_light::export::output_paths(&options, &[0], 800);
-    let paths = export_pages(&pdf, &[(0, 1100)], 800, &options, &|_, _| true);
+    let paths = export_pages(
+        &pdf,
+        &[(0, KeptPage::upright(1100))],
+        800,
+        &options,
+        &|_, _| true,
+    );
     // Original index 1100 doesn't exist in the one-page fixture, so use index 0.
     assert!(paths.is_err());
-    let paths = export_pages(&pdf, &[(0, 0)], 800, &options, &|_, _| true).expect("exports");
+    let paths = export_pages(
+        &pdf,
+        &[(0, KeptPage::upright(0))],
+        800,
+        &options,
+        &|_, _| true,
+    )
+    .expect("exports");
     assert_eq!(paths, expected);
     assert_eq!(existing_outputs(&expected), expected);
     assert!(paths[0].ends_with("doc_p001.png"));
     // With 1200 pages the same position would get four digits.
     let wide = pdf_light::export::output_paths(&options, &[0], 1200);
     assert!(wide[0].ends_with("doc_p0001.png"));
+}
+
+#[test]
+fn export_png_should_turn_rotated_pages() {
+    let dir = TempDir::new("png-turned");
+    let pdf = open_pdf(&Arc::new(make_pdf(&["a"]))).expect("opens");
+    let options = opts(&dir, ImageFormat::Png, 72, false);
+    let page = KeptPage {
+        index: 0,
+        rotation: Rotation::quarter_turns(1),
+    };
+    let paths = export_pages(&pdf, &[(0, page)], 1, &options, &|_, _| true).expect("exports");
+    let image = image::open(&paths[0]).expect("png decodes");
+    assert_eq!((image.width(), image.height()), (792, 612));
 }

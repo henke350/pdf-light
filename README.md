@@ -1,6 +1,6 @@
 # pdf-light
 
-A small, fast PDF reader for Windows, written in pure Rust. It is mainly for reading, plus a few jobs: search, delete pages, export pages to images, and print.
+A small, fast PDF reader for Windows, written in pure Rust. It is mainly for reading, plus a few jobs: search, rotate and delete pages, export pages to images, and print.
 
 No C libraries are involved (no PDFium, no MuPDF). Everything comes from crates.io.
 
@@ -9,6 +9,7 @@ No C libraries are involved (no PDFium, no MuPDF). Everything comes from crates.
 - Opens one PDF at a time (Open button, Ctrl+O, drag a file onto the window, or pass the file on the command line).
 - Reading: continuous vertical scroll, zoom (25 % up to 800 %), "Fit width" (the default).
 - Pages panel with thumbnails. Select pages, delete them, undo, then Save or Save as.
+- Rotate pages left or right (toolbar buttons, Ctrl+R / Ctrl+Shift+R, or the right-click menu). It turns the selected pages, or the page you're reading when none are selected. Undo takes a turn back, and Save writes it into the PDF. Export and Print use the turned pages too.
 - Find (Ctrl+F): every match is highlighted, step through them with the arrows or F3.
 - Export pages to PNG or TIFF (including one multi-page TIFF) at a DPI you choose.
 - Print through the normal Windows print dialog.
@@ -59,6 +60,14 @@ cargo build --release
 ```
 
 The program ends up at `target\release\pdf-light.exe`. It is a single file. You can copy it anywhere.
+
+The exe gets its icon (a red page with "PDF") from `assets\pdf-light.ico`, which `build.rs` builds into it with Windows' resource compiler (part of the Visual Studio Build Tools above). The icon is drawn in code in `src\app_icon.rs`. After changing the drawing, write the `.ico` again with:
+
+```
+cargo run --example make_icon
+```
+
+A test fails if the `.ico` and the drawing don't match.
 
 ### Make it your default PDF app (optional)
 
@@ -114,11 +123,13 @@ It prints document text only with `--show-text` (`cargo run --release --example 
 | Arrow keys | Scroll a little |
 | Home / End | Go to the top / bottom |
 | Delete | Delete the selected pages |
-| Ctrl+Z | Undo the last delete |
+| Ctrl+R | Rotate the selected pages (or the current page) right |
+| Ctrl+Shift+R | Rotate the selected pages (or the current page) left |
+| Ctrl+Z | Undo the last delete or rotation |
 | Ctrl+A (pages panel) | Select all pages |
 | Esc (pages panel) | Clear the selection |
 | Click, Ctrl+click, Shift+click on a thumbnail | Select one page / toggle a page / select a range |
-| Right-click a thumbnail | Menu: Delete, Export, Print for the selected pages |
+| Right-click a thumbnail | Menu: Rotate right, Rotate left, Delete, Export, Print for the selected pages |
 
 Ctrl+Z, Delete and the Ctrl zoom keys don't act on the document while a text field (find, zoom box) has focus.
 
@@ -187,11 +198,20 @@ Use only Microsoft Print to PDF.
 
 ### Look and feel
 
-37. The toolbar groups are Open, pages panel, Save, Save as; Delete, Undo; Find; Export, Print; and zoom. Hover each button for a tooltip with its shortcut. With nothing to do, a button is greyed and its tooltip says why (for example "No unsaved changes" or "Select pages in the sidebar first").
+37. The toolbar groups are Open, pages panel, Save, Save as; Delete, Rotate left, Rotate right, Undo; Find; Export, Print; and zoom. Hover each button for a tooltip with its shortcut. With nothing to do, a button is greyed and its tooltip says why (for example "No unsaved changes" or "Select pages in the sidebar first").
 38. With no file open, the window shows "Open a PDF to start reading" with an Open button and "or drop a file here".
 39. Switch Windows between light and dark (Settings, Personalisation, Colours, Choose your mode). pdf-light follows. Text, icons and the pages panel are readable in both, and the Delete button turns red when hovered.
 40. Make the window narrower. First the find field shrinks, then the button labels disappear and only icons stay, then the zoom controls wrap onto a second row. Nothing overlaps or is cut off.
 41. Press Tab to move focus through the toolbar. The focused button has a visible outline.
+
+### Rotating pages and the icon
+
+42. On a **copy**: with no pages selected, click Rotate right. The page you're reading turns a quarter turn clockwise, at once and without going blurry; its thumbnail turns too. The title gets a dot. Rotate left turns it back, and the dot goes away again (nothing left to save). The tooltips say "Rotate this page right (Ctrl+R)" and "Rotate this page left (Ctrl+Shift+R)".
+43. Select two pages in the panel and press Ctrl+R twice. Both turn upside down, and they stay selected. Ctrl+Z undoes one turn at a time. Right-click a page: the menu has "Rotate right" and "Rotate left".
+44. Search for a word on a turned page. The highlight sits on the word, and stepping to the match scrolls it into view.
+45. Turn a page, then Export it as PNG and Print it to Microsoft Print to PDF. Both come out turned.
+46. Turn a page and click "Save as". Open the saved file in pdf-light and in another viewer: the page is turned there too, and pdf-light shows nothing left to save. Rotate a page in a PDF whose pages are already turned in the file (for example one scanned sideways): the turn adds to it.
+47. The window's title bar, the taskbar and the exe in Explorer show a red page with "PDF" on it. (Explorer caches icons: if it still shows the old one, copy the exe to a new folder.)
 
 ## Credits and licences
 
@@ -208,6 +228,7 @@ pdf-light's own code is the owner's. It builds on these crates (licences as give
 | [windows](https://crates.io/crates/windows) 0.62 | Windows print dialog and printing | MIT OR Apache-2.0 |
 | [raw-window-handle](https://crates.io/crates/raw-window-handle) 0.6 | Window handle for the print dialog | MIT OR Apache-2.0 OR Zlib |
 | [thiserror](https://crates.io/crates/thiserror) and [anyhow](https://crates.io/crates/anyhow) | Error handling | MIT OR Apache-2.0 |
+| [winresource](https://crates.io/crates/winresource) 0.1 | Building the icon into the exe (build time only) | MIT |
 
 Their own dependencies (and fonts bundled with egui and hayro) have their own licences. `cargo metadata` lists them.
 

@@ -1,6 +1,7 @@
 //! pdf-light: a small PDF reader. The library holds the logic;
 //! the binary in `main.rs` only starts the window.
 
+pub mod app_icon;
 pub mod document;
 pub mod edit;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod pages;
 pub mod print_layout;
 pub mod render;
 pub mod render_pool;
+pub mod rotation;
 pub mod search;
 pub mod search_worker;
 pub mod selection;

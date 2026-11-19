@@ -14,6 +14,7 @@
 use eframe::egui;
 use pdf_light::document;
 use pdf_light::export::parse_page_range;
+use pdf_light::pages::KeptPage;
 use pdf_light::print_layout::{self, Dib, Placement, bands, bgr_dib};
 use pdf_light::render;
 use raw_window_handle::{
@@ -578,19 +579,19 @@ impl Drop for SpoolDocument<'_> {
 }
 
 /// Prints `positions` (0-based, current numbering; `kept[position]` is the
-/// page in the file) of the PDF in `bytes` on `job`'s printer. Runs on a
+/// page in the file, with the owner's turn) of the PDF in `bytes` on `job`'s printer. Runs on a
 /// background thread. `progress(done, total)` runs before each sheet; when it
 /// returns `false` the job is aborted with `Err(Cancelled)`. Returns how many
 /// sheets were sent (pages × the copies pdf-light made itself).
 pub fn print(
     bytes: &Arc<Vec<u8>>,
-    kept: &[usize],
+    kept: &[KeptPage],
     positions: &[usize],
     job: PrintJob,
     progress: &dyn Fn(usize, usize) -> bool,
 ) -> Result<usize, PrintError> {
     let failed = |error: pdf_light::error::PdfError| PrintError::Failed(error.to_string());
-    let pages: Vec<usize> = positions
+    let pages: Vec<KeptPage> = positions
         .iter()
         .filter_map(|&position| kept.get(position).copied())
         .collect();
@@ -617,14 +618,16 @@ pub fn print(
         }
         if last.as_ref().is_none_or(|(page, _, _)| *page != which) {
             let invalid = || failed(pdf_light::error::PdfError::Invalid);
-            let index = pages.get(which).copied().ok_or_else(invalid)?;
-            let page = pdf.pages().get(index).ok_or_else(invalid)?;
-            let size = page.render_dimensions();
+            let kept = pages.get(which).copied().ok_or_else(invalid)?;
+            let page = pdf.pages().get(kept.index).ok_or_else(invalid)?;
+            // The page as the owner sees it, so a turned page is placed turned.
+            let size = kept.rotation.size(page.render_dimensions());
             let placement = print_layout::place(size, area, dpi);
             let scale = print_layout::render_scale(size, &placement, dpi);
             // Free the previous bitmap before making the next one.
             drop(last.take());
-            let rendered = render::render_page(&pdf, index, scale).map_err(failed)?;
+            let rendered =
+                render::render_turned(&pdf, kept.index, scale, kept.rotation).map_err(failed)?;
             let dib = bgr_dib(
                 &rendered.rgba,
                 rendered.width,
@@ -729,7 +732,7 @@ impl PrintRun {
     pub fn start(
         ctx: &egui::Context,
         bytes: Arc<Vec<u8>>,
-        kept: Vec<usize>,
+        kept: Vec<KeptPage>,
         positions: Vec<usize>,
         job: PrintJob,
     ) -> Self {
@@ -990,7 +993,8 @@ mod tests {
         let bytes = Arc::new(test_pdf(&sizes));
         let positions = chosen_positions(&job.pages, sizes.len(), &[]).expect("all pages");
         let progress = |_: usize, _: usize| true;
-        let sent = print(&bytes, &[0, 1, 2], &positions, job, &progress).expect("prints");
+        let kept: Vec<KeptPage> = (0..sizes.len()).map(KeptPage::upright).collect();
+        let sent = print(&bytes, &kept, &positions, job, &progress).expect("prints");
         assert_eq!(sent, 3);
 
         // The spooler writes the file after EndDoc; wait until it opens as a PDF.
@@ -1061,7 +1065,8 @@ mod tests {
         let job = pdf_printer_job(&output.0);
         let bytes = Arc::new(test_pdf(&[(400.0, 500.0); 3]));
         let progress = |done: usize, _: usize| done < 1;
-        let outcome = print(&bytes, &[0, 1, 2], &[0, 1, 2], job, &progress);
+        let kept: Vec<KeptPage> = (0..3).map(KeptPage::upright).collect();
+        let outcome = print(&bytes, &kept, &[0, 1, 2], job, &progress);
         assert!(matches!(outcome, Err(PrintError::Cancelled)), "{outcome:?}");
         std::thread::sleep(Duration::from_secs(3));
         let printed = document::open(&output.0).map(|d| d.page_sizes.len());

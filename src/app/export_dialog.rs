@@ -13,6 +13,7 @@ use pdf_light::export::{
     ExportOptions, ImageFormat, WARN_PIXELS, existing_outputs, export_pages, output_paths,
     parse_page_range,
 };
+use pdf_light::pages::KeptPage;
 use pdf_light::render::{MAX_PIXELS, MAX_SIDE_PX, pixel_size};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -320,8 +321,8 @@ pub struct ExportDialog {
     phase: Phase,
     // The document, copied in so the dialog doesn't borrow from the app.
     bytes: Arc<Vec<u8>>,
-    /// Original page index for each current position.
-    kept: Vec<usize>,
+    /// The page in the file, with its turn, for each current position.
+    kept: Vec<KeptPage>,
     sizes: Vec<(f32, f32)>,
     selected: Vec<usize>,
 }
@@ -330,7 +331,7 @@ impl ExportDialog {
     pub fn new(
         pdf_path: &Path,
         bytes: Arc<Vec<u8>>,
-        kept: Vec<usize>,
+        kept: Vec<KeptPage>,
         sizes: Vec<(f32, f32)>,
         selected: Vec<usize>,
     ) -> Self {
@@ -455,7 +456,7 @@ impl ExportDialog {
             return;
         };
         let options = self.options(dpi);
-        let pages: Vec<(usize, usize)> = check
+        let pages: Vec<(usize, KeptPage)> = check
             .positions
             .iter()
             .filter_map(|&position| Some((position, *self.kept.get(position)?)))
@@ -910,7 +911,7 @@ mod tests {
         let mut dialog = ExportDialog::new(
             Path::new("a.pdf"),
             Arc::new(Vec::new()),
-            vec![0],
+            vec![KeptPage::upright(0)],
             vec![(612.0, 792.0)],
             vec![],
         );
@@ -936,7 +937,7 @@ mod tests {
         let mut dialog = ExportDialog::new(
             Path::new("a.pdf"),
             Arc::new(Vec::new()),
-            vec![0],
+            vec![KeptPage::upright(0)],
             vec![(612.0, 792.0)],
             vec![],
         );

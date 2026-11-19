@@ -4,7 +4,7 @@
 //! Like the page view, it lists the kept pages in order: positions count the
 //! pages shown, `pages[position]` is the page's index in the original file.
 
-use super::textures::{self, TextureCache, texture_key};
+use super::textures::{self, TextureCache, WHOLE_PAGE, paint_turned, texture_key};
 use super::theme::{self, Palette, SMALL_SIZE};
 use super::toolbar::{self, ToolbarAction, ToolbarState};
 use eframe::egui::{
@@ -12,6 +12,7 @@ use eframe::egui::{
     ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 use pdf_light::render_pool::{RenderRequest, RenderResult};
+use pdf_light::rotation::Rotation;
 use pdf_light::selection::Selection;
 use pdf_light::view::{self, PageLayout};
 use std::collections::HashSet;
@@ -112,14 +113,20 @@ impl PagesPanel {
         &self.wanted
     }
 
-    /// Draws the panel: the thumbnails of the kept pages (`sizes` in points,
-    /// `pages` their original indices) with `current` outlined and `selection`
-    /// marked, and the page count at the bottom. Clicks change `selection`.
+    /// Draws the panel: the thumbnails of the kept pages (`sizes` in points as
+    /// shown, `pages` their original indices, `rotations` how each is turned)
+    /// with `current` outlined and `selection` marked, and the page count at
+    /// the bottom. Clicks change `selection`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site; each argument is a different part of the frame"
+    )]
     pub fn show(
         &mut self,
         ui: &mut Ui,
         sizes: &[(f32, f32)],
         pages: &[usize],
+        rotations: &[Rotation],
         current: usize,
         selection: &mut Selection,
         state: &ToolbarState,
@@ -140,6 +147,7 @@ impl PagesPanel {
                 let list = List {
                     sizes,
                     pages,
+                    rotations,
                     current,
                     state,
                     palette,
@@ -292,8 +300,9 @@ impl PagesPanel {
 
         let scale = thumbnail_scale(ui.ctx(), page_size, thumb_width);
         if let Some(texture) = self.textures.best(page, scale, self.frame) {
-            let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-            painter.image(texture.id(), thumb, uv, egui::Color32::WHITE);
+            let rotation = list.rotations.get(position).copied().unwrap_or_default();
+            let white = egui::Color32::WHITE;
+            paint_turned(painter, texture.id(), thumb, WHOLE_PAGE, rotation, white);
         } else if self.failed.contains(&page) {
             painter.rect_filled(thumb, 0.0, palette.disabled());
         } else {
@@ -356,14 +365,18 @@ impl PagesPanel {
 struct List<'a> {
     sizes: &'a [(f32, f32)],
     pages: &'a [usize],
+    rotations: &'a [Rotation],
     current: usize,
     state: &'a ToolbarState,
     palette: &'static Palette,
 }
 
-/// The right-click menu: the toolbar's Delete, Export and Print for the selected pages.
+/// The right-click menu: the toolbar's Rotate, Delete, Export and Print for
+/// the selected pages.
 fn context_menu(ui: &mut Ui, count: usize, state: &ToolbarState, actions: &mut Vec<ToolbarAction>) {
     let items = [
+        (ToolbarAction::RotateRight, "Rotate right".to_owned()),
+        (ToolbarAction::RotateLeft, "Rotate left".to_owned()),
         (ToolbarAction::DeleteSelected, toolbar::delete_label(count)),
         (ToolbarAction::Export, menu_label("Export", count)),
         (ToolbarAction::Print, menu_label("Print", count)),

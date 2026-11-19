@@ -25,6 +25,7 @@ use pdf_light::document::{self, Document};
 use pdf_light::edit;
 use pdf_light::pages::PageList;
 use pdf_light::render_pool::{RenderPool, RenderRequest};
+use pdf_light::rotation::Rotation;
 use pdf_light::selection::Selection;
 use pdf_light::view;
 use sidebar::PagesPanel;
@@ -41,7 +42,7 @@ const STATUS_SECS: f64 = 5.0;
 /// another file is opened (dropping the old pool stops its workers).
 struct OpenDocument {
     document: Document,
-    /// Which original pages are still in the document, with undo.
+    /// Which original pages are still in the document and how they're turned, with undo.
     pages: PageList,
     /// Selected pages in the pages panel, as positions in `pages`.
     selection: Selection,
@@ -61,9 +62,14 @@ impl OpenDocument {
         file_name(&self.document.path)
     }
 
-    /// The sizes of the kept pages, in the order shown.
+    /// The sizes of the kept pages as shown (turned pages turned), in order.
     fn sizes(&self) -> Vec<(f32, f32)> {
-        view::kept_sizes(&self.document.page_sizes, self.pages.kept())
+        view::kept_sizes(&self.document.page_sizes, &self.pages.kept_pages())
+    }
+
+    /// How each kept page is turned, in the order shown.
+    fn rotations(&self) -> Vec<Rotation> {
+        self.pages.kept_rotations()
     }
 }
 
@@ -144,7 +150,7 @@ impl App {
         app
     }
 
-    /// Whether the open document has unsaved deletions.
+    /// Whether the open document has unsaved deletions or turns.
     fn is_modified(&self) -> bool {
         self.open
             .as_ref()
@@ -258,8 +264,8 @@ impl App {
         let name = file_name(target);
         // hayro's page count goes along, so lopdf's reading of the file can be checked.
         let page_count = open.document.page_sizes.len();
-        let saved =
-            edit::save_with_pages(&open.document.bytes, open.pages.kept(), page_count, target);
+        let kept = open.pages.kept_pages();
+        let saved = edit::save_with_pages(&open.document.bytes, &kept, page_count, target);
         if let Err(error) = saved {
             self.error = Some(ErrorMessage::new(format!("Couldn't save {name}"), &error));
             self.open = Some(open);
@@ -310,6 +316,22 @@ impl App {
         }
     }
 
+    /// Turns the selected pages a quarter turn (clockwise or not), or the
+    /// current page when none are selected. A hidden panel's selection can't be
+    /// seen, so it doesn't count (same rule as Delete). The selection stays,
+    /// so the same pages can be turned again.
+    fn rotate(&mut self, clockwise: bool) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        let positions = if self.pages_panel_open && !open.selection.is_empty() {
+            open.selection.positions()
+        } else {
+            vec![open.view.current_page()]
+        };
+        open.pages.rotate(&positions, clockwise);
+    }
+
     /// Opens the Export dialog. A hidden panel's selection can't be seen, so it
     /// doesn't count (same rule as Delete).
     fn open_export(&mut self) {
@@ -324,7 +346,7 @@ impl App {
         self.dialog = Some(Dialog::Export(Box::new(ExportDialog::new(
             &open.document.path,
             Arc::clone(&open.document.bytes),
-            open.pages.kept().to_vec(),
+            open.pages.kept_pages(),
             open.sizes(),
             selected,
         ))));
@@ -367,7 +389,7 @@ impl App {
                 self.printing = Some(print::PrintRun::start(
                     ctx,
                     Arc::clone(&open.document.bytes),
-                    open.pages.kept().to_vec(),
+                    open.pages.kept_pages(),
                     positions,
                     job,
                 ));
@@ -432,8 +454,7 @@ impl App {
         ToolbarState {
             file_name: Some(open.name()),
             is_modified: open.pages.is_modified(),
-            // Every unsaved change is a delete that can be undone.
-            can_undo: open.pages.is_modified(),
+            can_undo: open.pages.can_undo(),
             // A hidden panel's selection can't be seen, so it can't be deleted either.
             selected_count: if self.pages_panel_open {
                 open.selection.len()
@@ -461,6 +482,8 @@ impl App {
             }
             ToolbarAction::TogglePagesPanel => self.pages_panel_open = !self.pages_panel_open,
             ToolbarAction::DeleteSelected => self.delete_selected(),
+            ToolbarAction::RotateLeft => self.rotate(false),
+            ToolbarAction::RotateRight => self.rotate(true),
             ToolbarAction::Undo => {
                 if let Some(open) = &mut self.open
                     && open.pages.undo()
@@ -730,6 +753,7 @@ impl eframe::App for App {
                 sidebar::selection_keys(&ctx, &mut open.selection, open.pages.len());
             }
             let sizes = open.sizes();
+            let rotations = open.rotations();
             let current = open.view.current_page();
             let output = egui::Panel::left("pages-panel")
                 .resizable(true)
@@ -741,6 +765,7 @@ impl eframe::App for App {
                         ui,
                         &sizes,
                         open.pages.kept(),
+                        &rotations,
                         current,
                         &mut open.selection,
                         &state,
@@ -771,7 +796,10 @@ impl eframe::App for App {
                 .and_then(|found| Some((found.page, *found.rects.first()?)));
             if let Some((page, rect)) = target
                 && let Some(position) = kept.iter().position(|&p| p == page)
+                && let Some(&upright) = open.document.page_sizes.get(page)
             {
+                // Matches are found on the upright page; the view shows it turned.
+                let rect = open.pages.rotation(page).rect(rect, upright);
                 let sizes = open.sizes();
                 open.view.reveal(position, rect, &sizes);
             }
@@ -782,8 +810,14 @@ impl eframe::App for App {
             .show(ui, |ui| match &mut self.open {
                 Some(open) => {
                     let sizes = open.sizes();
-                    open.view
-                        .show(ui, &sizes, open.pages.kept(), open.find.matches());
+                    let rotations = open.rotations();
+                    open.view.show(
+                        ui,
+                        &sizes,
+                        open.pages.kept(),
+                        &rotations,
+                        open.find.matches(),
+                    );
                     false
                 }
                 None => page_view::empty_state(ui),
