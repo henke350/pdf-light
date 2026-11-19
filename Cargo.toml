@@ -35,6 +35,11 @@ windows = { version = "0.62", features = [
 # The main window's handle, which the print dialog needs as its owner.
 raw-window-handle = "0.6"
 
+# Builds `assets/pdf-light.ico` into the exe as its icon (see build.rs). It
+# runs Windows' resource compiler, which comes with the Visual Studio Build Tools.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 lto = true
 codegen-units = 1

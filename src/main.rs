@@ -10,6 +10,9 @@ mod app;
 use eframe::egui;
 use std::path::PathBuf;
 
+/// The window icon's size in pixels; Windows scales it for the title bar and taskbar.
+const WINDOW_ICON_SIZE: u32 = 64;
+
 // `anyhow::Result` holds any error type, which suits the top of the program.
 fn main() -> anyhow::Result<()> {
     // The first argument is the file to open, so Windows "Open with" works.
@@ -25,7 +28,13 @@ fn main() -> anyhow::Result<()> {
             .with_title("pdf-light")
             // Wide enough for the toolbar with every label (narrower windows drop them).
             .with_inner_size([1180.0, 760.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            // The title bar and taskbar icon; the exe's own icon comes from build.rs.
+            .with_icon(egui::IconData {
+                rgba: pdf_light::app_icon::rgba(WINDOW_ICON_SIZE),
+                width: WINDOW_ICON_SIZE,
+                height: WINDOW_ICON_SIZE,
+            }),
         // OpenGL starts faster and makes a smaller exe than wgpu (see Cargo.toml).
         renderer: eframe::Renderer::Glow,
         ..Default::default()
