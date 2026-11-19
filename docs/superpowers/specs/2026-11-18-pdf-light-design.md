@@ -28,7 +28,9 @@ It is a **personal project** (owner's GitHub, `henke350/pdf-light`), not COWI wo
 - Annotations, highlights-as-markup, forms, signatures, editing text on the page.
 - OCR: scanned PDFs without a text layer are viewable but not searchable.
 - Password-protected / encrypted PDFs (the renderer doesn't support them; show a clear message).
-- Several documents/tabs at once, printing, macOS/Linux builds (egui would allow them later).
+- Several documents/tabs at once, macOS/Linux builds (egui would allow them later).
+  (Printing was a non-goal; it was added at the owner's request on 2026-11-18. See the toolbar
+  addendum, section "Print".)
 
 **Anti-goals** — would make it a failure even if it "works"
 - Silently changing or overwriting the original file.
