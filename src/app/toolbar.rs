@@ -19,6 +19,10 @@ pub enum ToolbarAction {
     Save,
     SaveAs,
     DeleteSelected,
+    /// Turn the selected pages (or the current page) a quarter turn anticlockwise.
+    RotateLeft,
+    /// Turn the selected pages (or the current page) a quarter turn clockwise.
+    RotateRight,
     Undo,
     FindNext,
     FindPrevious,
@@ -131,6 +135,8 @@ pub fn icon_for(action: ToolbarAction) -> Option<Icon> {
         ToolbarAction::Save => Icon::Save,
         ToolbarAction::SaveAs => Icon::SaveAs,
         ToolbarAction::DeleteSelected => Icon::DeletePage,
+        ToolbarAction::RotateLeft => Icon::RotateLeft,
+        ToolbarAction::RotateRight => Icon::RotateRight,
         ToolbarAction::Undo => Icon::Undo,
         ToolbarAction::FindNext => Icon::NextMatch,
         ToolbarAction::FindPrevious => Icon::PreviousMatch,
@@ -201,7 +207,9 @@ fn label(action: ToolbarAction, state: &ToolbarState) -> Option<String> {
         ToolbarAction::Export => "Export…",
         ToolbarAction::Print => "Print…",
         ToolbarAction::FitWidth => "Fit width",
-        ToolbarAction::FindNext
+        ToolbarAction::RotateLeft
+        | ToolbarAction::RotateRight
+        | ToolbarAction::FindNext
         | ToolbarAction::FindPrevious
         | ToolbarAction::ZoomIn
         | ToolbarAction::ZoomOut
@@ -223,7 +231,10 @@ fn tooltip(action: ToolbarAction, state: &ToolbarState) -> String {
         }
         ToolbarAction::SaveAs => "Save a copy (Ctrl+Shift+S)",
         ToolbarAction::DeleteSelected => "Delete the selected pages (Delete)",
-        ToolbarAction::Undo => "Undo the last delete (Ctrl+Z)",
+        ToolbarAction::RotateLeft | ToolbarAction::RotateRight => {
+            return rotate_tooltip(action, state.selected_count);
+        }
+        ToolbarAction::Undo => "Undo the last change (Ctrl+Z)",
         ToolbarAction::FindNext => "Next match (F3)",
         ToolbarAction::FindPrevious => "Previous match (Shift+F3)",
         ToolbarAction::Export => "Export pages as PNG or TIFF (Ctrl+E)",
@@ -234,6 +245,22 @@ fn tooltip(action: ToolbarAction, state: &ToolbarState) -> String {
         ToolbarAction::FitWidth => "Fit the page to the window width",
     };
     text.to_owned()
+}
+
+/// "Rotate the selected pages right (Ctrl+R)", or "this page" when none are
+/// selected: what the Rotate buttons will turn.
+fn rotate_tooltip(action: ToolbarAction, selected: usize) -> String {
+    let (direction, keys) = if action == ToolbarAction::RotateLeft {
+        ("left", "Ctrl+Shift+R")
+    } else {
+        ("right", "Ctrl+R")
+    };
+    let pages = match selected {
+        0 => "this page",
+        1 => "the selected page",
+        _ => "the selected pages",
+    };
+    format!("Rotate {pages} {direction} ({keys})")
 }
 
 /// "125 %" for a zoom of 125.
@@ -296,6 +323,8 @@ fn left_items(state: &ToolbarState) -> Vec<Item> {
         Item::Button(A::SaveAs),
         Item::Separator,
         Item::Button(A::DeleteSelected),
+        Item::Button(A::RotateLeft),
+        Item::Button(A::RotateRight),
         Item::Button(A::Undo),
         Item::Separator,
         Item::FindField,
@@ -409,6 +438,8 @@ fn shortcut_actions(ctx: &egui::Context, state: &ToolbarState) -> Vec<ToolbarAct
     let mut shortcuts = vec![
         (ctrl | Modifiers::SHIFT, Key::S, A::SaveAs),
         (ctrl, Key::S, A::Save),
+        (ctrl | Modifiers::SHIFT, Key::R, A::RotateLeft),
+        (ctrl, Key::R, A::RotateRight),
         (ctrl, Key::O, A::Open),
         (ctrl, Key::E, A::Export),
         (ctrl, Key::P, A::Print),
@@ -710,6 +741,31 @@ mod tests {
             page_count,
             ..no_document()
         }
+    }
+
+    #[test]
+    fn rotate_tooltip_should_say_what_turns() {
+        assert_eq!(
+            [
+                rotate_tooltip(ToolbarAction::RotateRight, 0),
+                rotate_tooltip(ToolbarAction::RotateLeft, 3)
+            ],
+            [
+                "Rotate this page right (Ctrl+R)",
+                "Rotate the selected pages left (Ctrl+Shift+R)"
+            ]
+        );
+    }
+
+    #[test]
+    fn disabled_reason_should_allow_rotating_without_a_selection() {
+        assert_eq!(
+            [
+                disabled_reason(ToolbarAction::RotateLeft, &document(0, 5)),
+                disabled_reason(ToolbarAction::RotateRight, &no_document())
+            ],
+            [None, Some("Open a PDF first")]
+        );
     }
 
     #[test]

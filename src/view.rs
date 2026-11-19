@@ -2,6 +2,7 @@
 //!
 //! No UI types here, so everything can be unit-tested.
 
+use crate::pages::KeptPage;
 use std::ops::Range;
 
 /// Smallest zoom, in percent.
@@ -188,11 +189,12 @@ pub fn render_scale(page_size: (f32, f32), wanted: f32, max_side: usize) -> f32 
     (scale * 64.0).floor().max(1.0) / 64.0
 }
 
-/// The sizes of the kept pages, in the order shown (`kept` holds original page indices).
-pub fn kept_sizes(sizes: &[(f32, f32)], kept: &[usize]) -> Vec<(f32, f32)> {
+/// The sizes of the kept pages as shown: in order, each turned the way the
+/// owner turned it. `sizes` are the upright sizes of every page in the file.
+pub fn kept_sizes(sizes: &[(f32, f32)], kept: &[KeptPage]) -> Vec<(f32, f32)> {
     // `filter_map` drops the `None`s that `get` returns for indices out of range.
     kept.iter()
-        .filter_map(|&page| sizes.get(page).copied())
+        .filter_map(|page| Some(page.rotation.size(*sizes.get(page.index)?)))
         .collect()
 }
 
@@ -240,6 +242,7 @@ pub fn reveal(view_start: f32, len: f32, start: f32, end: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rotation::Rotation;
 
     fn two_pages() -> PageLayout {
         layout_pages(&[(100.0, 200.0), (100.0, 300.0)], 1.0, 10.0)
@@ -416,12 +419,22 @@ mod tests {
     #[test]
     fn kept_sizes_should_follow_kept_order() {
         let sizes = [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)];
-        assert_eq!(kept_sizes(&sizes, &[0, 2]), vec![(1.0, 1.0), (3.0, 3.0)]);
+        let kept = [KeptPage::upright(0), KeptPage::upright(2)];
+        assert_eq!(kept_sizes(&sizes, &kept), vec![(1.0, 1.0), (3.0, 3.0)]);
+    }
+
+    #[test]
+    fn kept_sizes_should_turn_rotated_pages() {
+        let kept = [KeptPage {
+            index: 0,
+            rotation: Rotation::quarter_turns(1),
+        }];
+        assert_eq!(kept_sizes(&[(1.0, 2.0)], &kept), vec![(2.0, 1.0)]);
     }
 
     #[test]
     fn kept_sizes_should_skip_unknown_pages() {
-        assert_eq!(kept_sizes(&[(1.0, 1.0)], &[5]), vec![]);
+        assert_eq!(kept_sizes(&[(1.0, 1.0)], &[KeptPage::upright(5)]), vec![]);
     }
 
     #[test]

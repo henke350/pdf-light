@@ -9,7 +9,9 @@
 
 use super::find::{Match, Matches};
 use super::icons::Icon;
-use super::textures::{self, TextureCache, TextureKey, texture_key};
+use super::textures::{
+    self, TextureCache, TextureKey, WHOLE_PAGE, paint_turned, texture_key, turned_rect,
+};
 use super::theme::{self, LARGE_SIZE, TEXT_SIZE};
 use super::toolbar::ToolButton;
 use eframe::egui::{
@@ -17,6 +19,7 @@ use eframe::egui::{
     Sense, TextureId, Vec2, pos2, vec2,
 };
 use pdf_light::render_pool::{RenderRequest, RenderResult};
+use pdf_light::rotation::Rotation;
 use pdf_light::text::PageRect;
 use pdf_light::view::{self, PageLayout};
 use std::collections::HashSet;
@@ -161,14 +164,16 @@ impl PageView {
         self.set_zoom(zoom, self.view_rect.size() / 2.0, sizes, now);
     }
 
-    /// Draws the kept pages (`sizes` in points, `pages` their original indices)
-    /// with the search `matches` marked, handles scrolling and zooming, and
-    /// works out which pages to render next.
+    /// Draws the kept pages (`sizes` in points as shown, `pages` their original
+    /// indices, `rotations` how each is turned) with the search `matches`
+    /// marked, handles scrolling and zooming, and works out which pages to
+    /// render next.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         sizes: &[(f32, f32)],
         pages: &[usize],
+        rotations: &[Rotation],
         matches: &Matches,
     ) {
         self.frame += 1;
@@ -200,7 +205,8 @@ impl PageView {
         }
         let output = area.show_viewport(ui, |ui, viewport| {
             let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
-            self.paint_pages(ui, rect.min, &layout, pages, matches, viewport, content.x);
+            let shown = Shown { pages, rotations };
+            self.paint_pages(ui, rect.min, &layout, &shown, matches, viewport, content.x);
         });
         self.offset = output.state.clamped_offset();
         self.view_rect = output.inner_rect;
@@ -301,7 +307,7 @@ impl PageView {
         ui: &egui::Ui,
         origin: Pos2,
         layout: &PageLayout,
-        pages: &[usize],
+        shown: &Shown<'_>,
         matches: &Matches,
         viewport: Rect,
         content_width: f32,
@@ -315,10 +321,11 @@ impl PageView {
             let (Some(&(width, height)), Some(&top), Some(&page)) = (
                 layout.sizes.get(position),
                 layout.tops.get(position),
-                pages.get(position),
+                shown.pages.get(position),
             ) else {
                 continue;
             };
+            let rotation = shown.rotations.get(position).copied().unwrap_or_default();
             let min = origin + vec2((content_width - width) / 2.0, MARGIN + top);
             let rect = Rect::from_min_size(
                 snap(min, ppp),
@@ -336,8 +343,7 @@ impl PageView {
                 .best(page, target_scale, self.frame)
                 .map(|t| t.id());
             if let Some(texture) = texture {
-                let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-                painter.image(texture, rect, uv, Color32::WHITE);
+                paint_turned(painter, texture, rect, WHOLE_PAGE, rotation, Color32::WHITE);
             } else if self.failed.iter().any(|&(p, _)| p == page) {
                 painter.rect_filled(rect, 0.0, Color32::from_gray(200));
                 painter.text(
@@ -352,7 +358,9 @@ impl PageView {
             }
             let marks = Marks {
                 page: rect,
-                px_per_pt,
+                // The page's upright size in points, which match positions refer to.
+                upright: rotation.size((width / px_per_pt, height / px_per_pt)),
+                rotation,
                 texture,
                 marker,
             };
@@ -401,10 +409,18 @@ impl PageView {
     }
 }
 
+/// The kept pages' original indices and turns, one each per position.
+struct Shown<'a> {
+    pages: &'a [usize],
+    rotations: &'a [Rotation],
+}
+
 /// How to mark search matches on one page, drawn on screen at `page`.
 struct Marks {
     page: Rect,
-    px_per_pt: f32,
+    /// The page's size in points before turning; match rects are on that page.
+    upright: (f32, f32),
+    rotation: Rotation,
     /// The page image, if one is showing.
     texture: Option<TextureId>,
     marker: Color32,
@@ -418,27 +434,27 @@ impl Marks {
     /// would wash the text out, and full Marker would hide it).
     fn paint<'a>(&self, painter: &Painter, matches: impl Iterator<Item = (&'a Match, bool)>) {
         let faint = Color32::WHITE.lerp_to_gamma(self.marker, MATCH_STRENGTH);
-        let size = self.page.size();
+        let (width, height) = (self.upright.0.max(1.0), self.upright.1.max(1.0));
         for (found, current) in matches {
             let tint = if current { self.marker } else { faint };
             for r in &found.rects {
-                let min = self.page.min + vec2(r.x0, r.y0) * self.px_per_pt;
-                let max = self.page.min + vec2(r.x1, r.y1) * self.px_per_pt;
-                let mark = Rect::from_min_max(min, max).intersect(self.page);
-                if !mark.is_positive() {
+                // The mark as fractions of the upright page, which is also
+                // where it sits in the (upright) page image.
+                let part = Rect::from_min_max(
+                    pos2(r.x0 / width, r.y0 / height),
+                    pos2(r.x1 / width, r.y1 / height),
+                )
+                .intersect(WHOLE_PAGE);
+                if !part.is_positive() {
                     continue;
                 }
                 match self.texture {
                     Some(texture) => {
-                        // The same part of the image: positions as fractions of the page.
-                        let uv = Rect::from_min_max(
-                            ((mark.min - self.page.min) / size).to_pos2(),
-                            ((mark.max - self.page.min) / size).to_pos2(),
-                        );
-                        painter.image(texture, mark, uv, tint);
+                        paint_turned(painter, texture, self.page, part, self.rotation, tint);
                     }
                     // A blank white page waiting for its image: white tinted is the tint.
                     None => {
+                        let mark = turned_rect(self.page, part, self.rotation);
                         painter.rect_filled(mark, 0.0, tint);
                     }
                 }

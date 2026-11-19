@@ -1,10 +1,14 @@
 //! Page images on the GPU, kept under a memory budget. The page view and the
 //! pages panel each keep their own cache.
 
-use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use eframe::egui::{
+    self, Color32, ColorImage, Mesh, Painter, Pos2, Rect, Shape, TextureHandle, TextureId,
+    TextureOptions, epaint::Vertex, pos2, vec2,
+};
 use pdf_light::error::PdfError;
 use pdf_light::render::RenderedPage;
 use pdf_light::render_pool::RenderRequest;
+use pdf_light::rotation::Rotation;
 use std::collections::HashMap;
 
 /// Cache key: original page index and the render scale's bits (an `f32` can't be a hash key).
@@ -107,4 +111,57 @@ impl TextureCache {
             self.total_bytes -= entry.bytes;
         }
     }
+}
+
+/// The whole page, as fractions of it.
+pub const WHOLE_PAGE: Rect = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+
+/// Paints `part` of an upright page image (`part` as fractions of the page,
+/// 0 to 1) turned by `rotation`, on a page drawn at `page` on screen, with
+/// `tint` multiplied in. Page images are always rendered upright, so turning a
+/// page only changes how it is drawn: nothing is rendered again.
+pub fn paint_turned(
+    painter: &Painter,
+    texture: TextureId,
+    page: Rect,
+    part: Rect,
+    rotation: Rotation,
+    tint: Color32,
+) {
+    let mut mesh = Mesh::with_texture(texture);
+    // The part's corners in order; each keeps its place in the image (`uv`)
+    // and moves to where the turn puts it on screen.
+    let corners = [
+        part.left_top(),
+        part.right_top(),
+        part.right_bottom(),
+        part.left_bottom(),
+    ];
+    for uv in corners {
+        mesh.vertices.push(Vertex {
+            pos: turned_point(page, uv, rotation),
+            uv,
+            color: tint,
+        });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Where `part` of an upright page (fractions, as in `paint_turned`) appears
+/// on a page drawn turned by `rotation` at `page` on screen.
+pub fn turned_rect(page: Rect, part: Rect, rotation: Rotation) -> Rect {
+    // Quarter turns keep the rect's sides level, so two opposite corners are enough.
+    Rect::from_two_pos(
+        turned_point(page, part.min, rotation),
+        turned_point(page, part.max, rotation),
+    )
+}
+
+/// The screen position of the point `fraction` of an upright page, on a page
+/// drawn turned by `rotation` at `page`.
+fn turned_point(page: Rect, fraction: Pos2, rotation: Rotation) -> Pos2 {
+    let (u, v) = rotation.fraction((fraction.x, fraction.y));
+    page.min + vec2(u * page.width(), v * page.height())
 }

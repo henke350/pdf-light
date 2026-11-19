@@ -1,6 +1,7 @@
 //! Rendering one PDF page to an RGBA pixel buffer.
 
 use crate::error::PdfError;
+use crate::rotation::Rotation;
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -61,4 +62,15 @@ pub fn render_page(pdf: &Pdf, index: usize, scale: f32) -> Result<RenderedPage, 
         height: u32::from(pixmap.height()),
         rgba: pixmap.data_as_u8_slice().to_vec(),
     })
+}
+
+/// Renders page `index` at `scale`, then turns the image by `rotation`
+/// (for export and printing, where the turn must be in the pixels).
+pub fn render_turned(
+    pdf: &Pdf,
+    index: usize,
+    scale: f32,
+    rotation: Rotation,
+) -> Result<RenderedPage, PdfError> {
+    render_page(pdf, index, scale).map(|page| rotation.image(page))
 }

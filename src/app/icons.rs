@@ -13,6 +13,8 @@ pub enum Icon {
     Save,
     SaveAs,
     DeletePage,
+    RotateLeft,
+    RotateRight,
     Undo,
     Find,
     PreviousMatch,
@@ -27,12 +29,14 @@ pub enum Icon {
 impl Icon {
     /// Every icon, for the tests.
     #[cfg(test)]
-    pub const ALL: [Icon; 14] = [
+    pub const ALL: [Icon; 16] = [
         Icon::PagesPanel,
         Icon::Open,
         Icon::Save,
         Icon::SaveAs,
         Icon::DeletePage,
+        Icon::RotateLeft,
+        Icon::RotateRight,
         Icon::Undo,
         Icon::Find,
         Icon::PreviousMatch,
@@ -136,6 +140,42 @@ pub fn shapes(icon: Icon) -> &'static [Shape] {
                     ]),
                     line(&[[10.0, 1.5], [10.0, 4.5], [13.0, 4.5]]),
                     line(&[[5.5, 9.5], [10.5, 9.5]]),
+                ]
+            }
+        }
+        // Three quarters of a circle with the arrowhead at its end, pointing
+        // the way the page turns. Rotate left is Rotate right mirrored.
+        Icon::RotateRight => {
+            const {
+                &[
+                    line(&[
+                        [3.17, 11.5],
+                        [2.5, 9.0],
+                        [3.17, 6.5],
+                        [5.0, 4.67],
+                        [7.5, 4.0],
+                        [10.0, 4.67],
+                        [11.83, 6.5],
+                        [12.5, 9.0],
+                    ]),
+                    line(&[[10.0, 6.5], [12.5, 9.0], [15.0, 6.5]]),
+                ]
+            }
+        }
+        Icon::RotateLeft => {
+            const {
+                &[
+                    line(&[
+                        [12.83, 11.5],
+                        [13.5, 9.0],
+                        [12.83, 6.5],
+                        [11.0, 4.67],
+                        [8.5, 4.0],
+                        [6.0, 4.67],
+                        [4.17, 6.5],
+                        [3.5, 9.0],
+                    ]),
+                    line(&[[6.0, 6.5], [3.5, 9.0], [1.0, 6.5]]),
                 ]
             }
         }
@@ -294,6 +334,8 @@ mod tests {
             | ToolbarAction::Save
             | ToolbarAction::SaveAs
             | ToolbarAction::DeleteSelected
+            | ToolbarAction::RotateLeft
+            | ToolbarAction::RotateRight
             | ToolbarAction::Undo
             | ToolbarAction::FindNext
             | ToolbarAction::FindPrevious
@@ -314,6 +356,8 @@ mod tests {
             ToolbarAction::Save,
             ToolbarAction::SaveAs,
             ToolbarAction::DeleteSelected,
+            ToolbarAction::RotateLeft,
+            ToolbarAction::RotateRight,
             ToolbarAction::Undo,
             ToolbarAction::FindNext,
             ToolbarAction::FindPrevious,

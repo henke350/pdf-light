@@ -1,6 +1,7 @@
 //! Exporting pages as PNG or TIFF images.
 
 use crate::error::PdfError;
+use crate::pages::KeptPage;
 use crate::render::{self, pixel_size};
 use hayro::hayro_syntax::Pdf;
 use std::collections::BTreeSet;
@@ -89,7 +90,7 @@ pub fn existing_outputs(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths.iter().filter(|path| path.exists()).cloned().collect()
 }
 
-/// Exports `pages` (pairs of position and original page index) and returns the files written.
+/// Exports `pages` (pairs of position and the page with its turn) and returns the files written.
 /// `page_count` is the page count of the document as the owner sees it (after deletions);
 /// it decides the file-name padding, the same as the dialog's preview uses.
 ///
@@ -99,7 +100,7 @@ pub fn existing_outputs(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// taking two numbers and returning a bool fits.
 pub fn export_pages(
     pdf: &Pdf,
-    pages: &[(usize, usize)],
+    pages: &[(usize, KeptPage)],
     page_count: usize,
     opts: &ExportOptions,
     progress: &dyn Fn(usize, usize) -> bool,
@@ -108,8 +109,9 @@ pub fn export_pages(
     let all_pages = pdf.pages();
 
     // Check every page's size first, so a too-big page writes nothing at all.
-    for &(_, index) in pages {
-        let page = all_pages.get(index).ok_or(PdfError::Invalid)?;
+    // (Turning a page swaps width and height, which doesn't change the checks.)
+    for (_, kept) in pages {
+        let page = all_pages.get(kept.index).ok_or(PdfError::Invalid)?;
         let (width, height) = pixel_size(page.render_dimensions(), scale);
         render::check_size(width, height)?;
     }
@@ -162,8 +164,8 @@ struct RgbPage {
     rgb: Vec<u8>,
 }
 
-fn render_rgb(pdf: &Pdf, index: usize, scale: f32) -> Result<RgbPage, PdfError> {
-    let rendered = render::render_page(pdf, index, scale)?;
+fn render_rgb(pdf: &Pdf, page: KeptPage, scale: f32) -> Result<RgbPage, PdfError> {
+    let rendered = render::render_turned(pdf, page.index, scale, page.rotation)?;
     // Drop the alpha channel: pages are opaque white-backed, so RGB loses nothing.
     let rgb = rendered
         .rgba
@@ -186,7 +188,7 @@ fn image_error(error: impl std::fmt::Display) -> PdfError {
 /// Renders and writes every page, recording each created file in `written`.
 fn write_all(
     pdf: &Pdf,
-    pages: &[(usize, usize)],
+    pages: &[(usize, KeptPage)],
     opts: &ExportOptions,
     scale: f32,
     paths: &[PathBuf],
@@ -208,16 +210,16 @@ fn write_all(
         let file = File::create(path)?;
         written.push(path);
         return write_tiff(file, |encoder| {
-            for (done, &(_, index)) in pages.iter().enumerate() {
-                write_tiff_page(encoder, &render_rgb(pdf, index, scale)?)?;
+            for (done, &(_, page)) in pages.iter().enumerate() {
+                write_tiff_page(encoder, &render_rgb(pdf, page, scale)?)?;
                 report(done + 1)?;
             }
             Ok(())
         });
     }
 
-    for (done, &(_, index)) in pages.iter().enumerate() {
-        let page = render_rgb(pdf, index, scale)?;
+    for (done, &(_, kept)) in pages.iter().enumerate() {
+        let page = render_rgb(pdf, kept, scale)?;
         let path = paths.get(done).ok_or(PdfError::Invalid)?;
         written.push(path);
         match opts.format {
